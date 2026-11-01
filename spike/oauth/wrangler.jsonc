@@ -1,0 +1,30 @@
+// TopRelay OAuth spike: OAuth 2.1 (CIMD + DCR) in front of a hello-world MCP server.
+// Questions it answers (docs/brief.md, build step 2):
+//   1. Does claude.ai complete the OAuth flow against this server, using CIMD ("Use Claude's published identity")
+//      and DCR ("Register automatically")?
+//   2. Is a pairing code on the consent page enough for a single owner?
+//   3. Does the token check fit Workers Free's 10 ms CPU per request?
+// Setup: see README.md. Secret: PAIR_CODE (npx wrangler secret put PAIR_CODE).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "toprelay-oauth-spike",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // nodejs_compat: agents/mcp/server uses AsyncLocalStorage.
+  // global_fetch_strictly_public: required for CIMD (SSRF protection on metadata document fetches).
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  "kv_namespaces": [
+    // Create with: npx wrangler kv namespace create OAUTH_KV   then paste the id here.
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_ID" }
+  ],
+  "vars": {
+    // The exact URL MCP clients connect to; every token is bound to it. Set after the first deploy
+    // (wrangler prints the workers.dev URL). For wrangler dev, .dev.vars overrides it with localhost.
+    "MCP_RESOURCE": "https://toprelay-oauth-spike.REPLACE_WITH_SUBDOMAIN.workers.dev/mcp"
+  },
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": true }
+  }
+}

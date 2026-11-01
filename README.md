@@ -1,4 +1,8 @@
-# TopRelay
+<p align="center">
+  <img src="design/app-icon-256.png" width="128" height="128" alt="TopRelay app icon: a glowing glass bridge from a local app to an AI">
+</p>
+
+<h1 align="center">TopRelay</h1>
 
 **Status: early development. The engine works end to end locally; real-bot testing and the Mac app are next.**
 

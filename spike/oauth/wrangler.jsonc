@@ -16,12 +16,12 @@
   "workers_dev": true,
   "kv_namespaces": [
     // Create with: npx wrangler kv namespace create OAUTH_KV   then paste the id here.
-    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_ID" }
+    { "binding": "OAUTH_KV", "id": "36ef2318fc2341d9b4ecb78a98958944" }
   ],
   "vars": {
     // The exact URL MCP clients connect to; every token is bound to it. Set after the first deploy
     // (wrangler prints the workers.dev URL). For wrangler dev, .dev.vars overrides it with localhost.
-    "MCP_RESOURCE": "https://toprelay-oauth-spike.REPLACE_WITH_SUBDOMAIN.workers.dev/mcp"
+    "MCP_RESOURCE": "https://toprelay-oauth-spike.harikanth-ai.workers.dev/mcp"
   },
   "observability": {
     "enabled": true,

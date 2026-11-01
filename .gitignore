@@ -11,3 +11,9 @@ coverage/
 /agent/bin/
 *.test
 *.out
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/

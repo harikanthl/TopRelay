@@ -162,7 +162,7 @@ as they arrive. Worker ↔ Durable Object calls carry streams with flow control.
   on Streamable HTTP so 2026-07-28 is offered (without it the SDK negotiates down to 2025-11-25).
 - **Transport-agnostic handler:** the agent's MCP layer is an `http.Handler` that doesn't care how requests arrive
   (the Durable Object socket today; a `tsnet` listener for a later `--private` mode).
-- **Legacy SSE endpoint** (`/<service>/sse`) for the `stdio` bridge: Alibaba Model Studio (Qwen) accepts only SSE.
+- **Legacy SSE endpoint** (`/<service>/mcp/sse`) for the `stdio` bridge: Alibaba Model Studio (Qwen) accepts only SSE.
   Gemini accepts only Streamable HTTP. Streamable HTTP stays the default.
 - **Tool allow-list:** filter `tools/list` results (JSON and SSE), keeping the server's order and its
   `ttlMs`/`cacheScope` cache hints, and answer a disallowed `tools/call` without touching the app. Answer it, and

@@ -48,6 +48,7 @@ struct MenuBarView: View {
         case .loading: return "Loading…"
         case .engineMissing: return "Engine missing"
         case .needsLogin: return "Not set up"
+        case .failed: return "Needs attention"
         case .ready:
             switch model.health {
             case .noServices: return "No apps shared"
@@ -73,6 +74,13 @@ struct MenuBarView: View {
         case .needsLogin:
             prompt(text: "Connect your Cloudflare account to give your apps a private address any AI can reach.",
                    button: "Set up TopRelay") { open(nil) }
+        case .failed(let failure):
+            VStack(alignment: .leading, spacing: 8) {
+                ErrorBanner(failure: failure)
+                Button("Try again") { Task { await model.reload() } }.buttonStyle(PressableStyle())
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
         case .ready where model.services.isEmpty:
             prompt(text: "Share an app on this Mac (an MCP server or a local web app) with your AI tools.",
                    button: "Share an app") { open(.add) }

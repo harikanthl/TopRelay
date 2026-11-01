@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-// sender delivers frames to the relay in order.
+// sender delivers frames to the relay in order. ctx is checked before the write (a cancelled request sends
+// nothing more) but doesn't bound the write itself, so cancelling one request never tears down the socket.
 type sender interface {
 	send(ctx context.Context, v any) error
 }

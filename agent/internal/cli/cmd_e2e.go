@@ -187,7 +187,11 @@ func (a *App) localSession(ctx context.Context, s *config.Service) (*mcp.ClientS
 		}
 		return cs, func() { cs.Close() }, nil
 	default:
-		cmd, err := stdiobridge.Command(ctx, s.Source.Command, s.Source.Env, s.Source.Cwd)
+		env, err := a.stdioEnv(s)
+		if err != nil {
+			return nil, nil, err
+		}
+		cmd, err := stdiobridge.Command(ctx, s.Source.Command, env, s.Source.Cwd)
 		if err != nil {
 			return nil, nil, err
 		}

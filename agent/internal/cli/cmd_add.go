@@ -2,9 +2,11 @@ package cli
 
 import (
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -84,7 +86,7 @@ func cmdAdd(a *App, args []string) error {
 		return usageErr("--tools-default must be allow-readonly, deny or allow-all")
 	}
 
-	cfg, err := config.LoadOrEmpty(a.Dir)
+	cfg, err := config.LoadOrEmptyMigrated(a.Dir, a.Store)
 	if err != nil {
 		return wrap("config", "fix or delete "+config.Path(a.Dir), err)
 	}
@@ -100,6 +102,7 @@ func cmdAdd(a *App, args []string) error {
 
 	s := config.Service{Name: name, Gen: 1}
 	var warnings []string
+	var envValues map[string]string
 	switch {
 	case *mcpURL != "":
 		if err := checkURL(*mcpURL); err != nil {
@@ -126,10 +129,13 @@ func cmdAdd(a *App, args []string) error {
 		} else if abs, err := filepath.Abs(dir); err == nil {
 			dir = abs
 		}
-		s.Kind, s.Source = config.KindMCP, config.Source{Type: config.SourceStdio, Command: rest, Env: env, Cwd: dir}
-		if len(env) == 0 {
-			s.Source.Env = nil
+		// Values go to the keyring (after the deploy); config.json and --json output only carry the names.
+		s.Kind, s.Source = config.KindMCP, config.Source{Type: config.SourceStdio, Command: rest, Cwd: dir}
+		for _, k := range slices.Sorted(maps.Keys(env)) {
+			s.Source.EnvNames = append(s.Source.EnvNames, k)
+			redact.Add(env[k])
 		}
+		envValues = env
 		warnings = append(warnings, "stdio servers run with your user's permissions: everything the command can do on this computer, an allowed tool call can trigger")
 	case *httpURL != "":
 		if err := checkURL(*httpURL); err != nil {
@@ -163,7 +169,7 @@ func cmdAdd(a *App, args []string) error {
 	var views []ToolView
 	if s.Kind == config.KindMCP {
 		a.note("Connecting to %s …\n", s.LocalTarget())
-		tools, err := a.listLocalTools(&s, headerValue)
+		tools, err := a.listLocalTools(&s, headerValue, envValues)
 		if err != nil {
 			return err
 		}
@@ -192,6 +198,11 @@ func cmdAdd(a *App, args []string) error {
 	}
 	if headerValue != "" {
 		if err := a.Store.Set(secrets.UpstreamHeader(name), headerValue); err != nil {
+			return wrap("keyring", "check keyring access", err)
+		}
+	}
+	for _, k := range s.Source.EnvNames {
+		if err := a.Store.Set(secrets.StdioEnv(name, k), envValues[k]); err != nil {
 			return wrap("keyring", "check keyring access", err)
 		}
 	}

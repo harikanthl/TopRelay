@@ -53,12 +53,20 @@ export function forwardedRequestHeaders(source: Headers, ip: string, host: strin
   return out;
 }
 
+/** Tab, visible ASCII and bytes 0x80–0xFF: no NUL, no other control characters, no CR/LF. */
+const SAFE_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/;
+
 export function filterResponseHeaders(source: Record<string, unknown> | undefined): Headers {
   const out = new Headers();
   if (!source || typeof source !== "object") return out;
   for (const [name, value] of Object.entries(source)) {
     const lower = name.toLowerCase();
-    if (RESPONSE_HEADERS.has(lower) && typeof value === "string" && !/[\r\n]/.test(value)) out.set(lower, value);
+    if (!RESPONSE_HEADERS.has(lower) || typeof value !== "string" || !SAFE_VALUE.test(value)) continue;
+    try {
+      out.set(lower, value);
+    } catch {
+      // workerd refused it: drop the header rather than the whole response
+    }
   }
   return out;
 }

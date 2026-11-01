@@ -11,6 +11,7 @@ import {
 import type { ConsentDescription, OAuthResourceContext } from "@cloudflare/workers-oauth-provider";
 import type { Config, Env, Service } from "./config";
 import { resourceFor } from "./config";
+import { INTERNAL } from "./headers";
 import { verifyBearer } from "./keys";
 
 export interface RelayProps {
@@ -176,11 +177,11 @@ const PAIR_ERRORS: Record<string, string> = {
   too_many_attempts: "Too many attempts. Wait a few minutes, then try again.",
 };
 
-async function checkPairCode(env: Env, service: Service, code: string): Promise<{ ok: boolean; reason?: string }> {
+async function checkPairCode(env: Env, service: Service, code: string, ip: string): Promise<{ ok: boolean; reason?: string }> {
   const stub = env.RELAY.get(env.RELAY.idFromName(service.name));
   const res = await stub.fetch("https://relay/pair-verify", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", [INTERNAL.ip]: ip },
     body: JSON.stringify({ code }),
   });
   return res.json();
@@ -206,26 +207,30 @@ export async function authorize(request: Request, env: Env, config: Config, setu
         const denied = await oauth.denyConsent(request, handle);
         return new Response(null, { status: 302, headers: denied.headers });
       }
-      const service = config.services.get(String(form.get("service") ?? ""));
-      if (!service) return page("Unknown service", "<h1>Unknown service</h1>", 400);
-
-      const check = await checkPairCode(env, service, String(form.get("code") ?? ""));
-      if (!check.ok) {
-        const message = PAIR_ERRORS[check.reason ?? ""] ?? "The pairing code couldn't be checked.";
-        return page("Pairing code", `<h1>Not yet</h1><p class="warn" role="alert">${escape(message)}</p><p>Go back and try again.</p>`, 403);
-      }
-
+      // Validate the browser's consent session first (handle + cookie), so a request without a real consent page
+      // can't spend pairing attempts or the owner's code. Approving consumes the handle; on a wrong code the page is
+      // shown again with a fresh one.
       const approved = await oauth.approveConsent(request, handle, { scope: ["mcp", "offline_access"] });
-      if (serviceFromResource(config, approved.request.resource)?.name !== service.name) {
+      const service = serviceFromResource(config, approved.request.resource);
+      if (!service || service.name !== String(form.get("service") ?? "")) {
         return page("Can't authorize", "<h1>Can't authorize</h1><p>The request doesn't match this service. Start connecting again.</p>", 400);
       }
-      const requested = new Set(approved.request.scope);
-      const scope = ["mcp", ...(requested.has("offline_access") ? ["offline_access"] : [])];
+
+      const check = await checkPairCode(env, service, String(form.get("code") ?? ""), request.headers.get("cf-connecting-ip") ?? "");
+      if (!check.ok) {
+        const message = PAIR_ERRORS[check.reason ?? ""] ?? "The pairing code couldn't be checked.";
+        const details = await oauth.describeConsent(approved.request);
+        const again = await oauth.beginConsent(approved.request);
+        for (const [name, value] of approved.headers) if (name.toLowerCase() === "set-cookie") again.headers.append(name, value);
+        return page(`Allow ${details.clientName}?`, consentBody(service, details, again.handle, message), 403, again.headers);
+      }
+
+      // Always grant mcp plus offline_access, so bots can refresh instead of asking the owner again every hour.
       const { redirectTo } = await oauth.completeAuthorization({
         request: approved.request,
         userId: `svc-${service.name}`,
         metadata: { service: service.name },
-        scope,
+        scope: approved.request.scope,
         props: { service: service.name } satisfies RelayProps,
       });
       approved.headers.set("location", redirectTo);

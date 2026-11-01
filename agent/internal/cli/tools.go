@@ -54,8 +54,9 @@ func toolViews(service string, tools []*mcp.Tool, p config.ToolPolicy) []ToolVie
 	return out
 }
 
-// listLocalTools connects to the service's local MCP server and lists its tools.
-func (a *App) listLocalTools(s *config.Service, headerValue string) ([]*mcp.Tool, error) {
+// listLocalTools connects to the service's local MCP server and lists its tools. env is the stdio child's
+// environment (values from the keyring, or from --env during add).
+func (a *App) listLocalTools(s *config.Service, headerValue string, env map[string]string) ([]*mcp.Tool, error) {
 	ctx, cancel := context.WithTimeout(a.Ctx, 30*time.Second)
 	defer cancel()
 	switch s.Source.Type {
@@ -70,13 +71,22 @@ func (a *App) listLocalTools(s *config.Service, headerValue string) ([]*mcp.Tool
 		}
 		return tools, nil
 	case config.SourceStdio:
-		tools, err := stdiobridge.ListChildTools(ctx, s.Source.Command, s.Source.Env, s.Source.Cwd)
+		tools, err := stdiobridge.ListChildTools(ctx, s.Source.Command, env, s.Source.Cwd)
 		if err != nil {
 			return nil, errf("local_unreachable", "check that the command runs on its own and speaks MCP over stdio", "%v", err)
 		}
 		return tools, nil
 	}
 	return nil, errors.New("not an MCP service")
+}
+
+// stdioEnv reads a stdio service's environment values from the keyring.
+func (a *App) stdioEnv(s *config.Service) (map[string]string, error) {
+	env, err := secrets.LoadEnv(a.Store, s.Name, s.Source.EnvNames)
+	if err != nil {
+		return nil, wrap("keyring", "remove and re-add the service with its --env values", err)
+	}
+	return env, nil
 }
 
 func (a *App) upstreamValue(s *config.Service) (string, error) {

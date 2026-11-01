@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -414,6 +415,7 @@ keyring. Its call log is kept in <config dir>/logs.`)
 		return err
 	}
 	name := s.Name
+	envNames := slices.Clone(s.Source.EnvNames) // cfg.Remove below shifts the slice s points into
 	var warnings []string
 	revoked := 0
 	key, kerr := a.agentKey(s)
@@ -436,6 +438,9 @@ keyring. Its call log is kept in <config dir>/logs.`)
 	}
 	if err := a.Store.Delete(secrets.UpstreamHeader(name)); err != nil {
 		warnings = append(warnings, "couldn't delete the upstream header secret: "+err.Error())
+	}
+	if err := secrets.DeleteEnv(a.Store, name, envNames); err != nil {
+		warnings = append(warnings, "couldn't delete the stdio environment secrets: "+err.Error())
 	}
 	return a.emit(map[string]any{"service": name, "removed": true, "oauthRevoked": revoked, "warnings": nonNil(warnings)}, func() {
 		a.say("✓ %s removed from the relay (%d OAuth grants revoked)\n", name, revoked)

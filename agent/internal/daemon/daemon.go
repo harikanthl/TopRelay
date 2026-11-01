@@ -85,7 +85,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer d.state.Stop()
 
-	cfg, err := config.Load(d.Dir)
+	cfg, err := config.LoadMigrated(d.Dir, d.Store)
 	if err != nil {
 		return err
 	}
@@ -110,7 +110,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}
 		stamp = fileStamp(config.Path(d.Dir))
-		cfg, err := config.Load(d.Dir)
+		cfg, err := config.LoadMigrated(d.Dir, d.Store)
 		if err != nil {
 			d.Log.Error("config reload failed; keeping the running services", "err", err)
 			continue
@@ -234,6 +234,11 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 		}
 		upstream = v
 	}
+	// The stdio child's environment comes from the keyring, into a copy only: it never reaches config.json.
+	bs := s
+	if bs.Source.Env, err = secrets.LoadEnv(d.Store, s.Name, s.Source.EnvNames); err != nil {
+		return err
+	}
 	logw, err := calllog.Open(calllog.Path(d.Dir, s.Name))
 	if err != nil {
 		return fmt.Errorf("open call log: %w", err)
@@ -247,7 +252,7 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 		})
 	}
 	log := d.Log // every component logs the service name itself
-	rt, err := service.Build(s, upstream, logw, log)
+	rt, err := service.Build(bs, upstream, logw, log)
 	if err != nil {
 		logw.Close()
 		return err

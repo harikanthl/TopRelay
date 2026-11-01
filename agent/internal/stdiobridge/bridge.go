@@ -463,7 +463,13 @@ func (b *Bridge) serveSSE(w http.ResponseWriter, r *http.Request) {
 		restriction, restricted := reqctx.Tools(r.Context())
 		allowed := mcpproxy.Restrict(b.o.Allowed, restriction, restricted)
 		if d := mcpproxy.Decide(body, "", b.o.Service, allowed); d.Refuse {
-			w.Header().Set(mcpproxy.RefusedHeader, strings.Join(d.Tools, ","))
+			w.Header().Set(mcpproxy.RefusedHeader, d.RefusedLabel())
+			if d.Invalid {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(d.Status)
+				w.Write(d.Body)
+				return
+			}
 			http.Error(w, mcpproxy.RefusalText(d.Tools[0], b.o.Service), http.StatusForbidden)
 			return
 		}

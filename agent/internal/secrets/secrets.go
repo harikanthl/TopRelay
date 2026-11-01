@@ -29,6 +29,34 @@ const (
 // UpstreamHeader is the secret name for a service's upstream header value.
 func UpstreamHeader(service string) string { return "upstream-header/" + service }
 
+// StdioEnv is the secret name for one environment variable of a stdio service.
+func StdioEnv(service, name string) string { return "stdio-env/" + service + "/" + name }
+
+// LoadEnv reads a stdio service's environment variables from the store.
+func LoadEnv(s Store, service string, names []string) (map[string]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	env := make(map[string]string, len(names))
+	for _, n := range names {
+		v, err := Require(s, StdioEnv(service, n), "re-add the service with --env "+n+"=…")
+		if err != nil {
+			return nil, err
+		}
+		env[n] = v
+	}
+	return env, nil
+}
+
+// DeleteEnv removes a stdio service's environment variables from the store.
+func DeleteEnv(s Store, service string, names []string) error {
+	var errs []error
+	for _, n := range names {
+		errs = append(errs, s.Delete(StdioEnv(service, n)))
+	}
+	return errors.Join(errs...)
+}
+
 // ErrNotFound means the secret isn't stored.
 var ErrNotFound = errors.New("secret not found")
 

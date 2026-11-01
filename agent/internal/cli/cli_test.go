@@ -202,12 +202,22 @@ func TestCLIEndToEnd(t *testing.T) {
 	// A stdio service (the tiny server) with --tools-default allow-all, and an http service.
 	tiny := buildTiny(t)
 	var addedS AddResult
-	e.runJSON(0, &addedS, "add", "tools", "--stdio", "--tools-default", "allow-all", "--env", "TINY_GREETING=x", "--", tiny)
+	e.runJSON(0, &addedS, "add", "tools", "--stdio", "--tools-default", "allow-all", "--env", "TINY_GREETING=greeting-s3cret-value", "--", tiny)
 	if addedS.SSEURL != "https://toprelay.hari.workers.dev/tools/mcp/sse" || addedS.Service.Tools.Default != "allow" || len(addedS.Tools) != 4 {
 		t.Fatalf("stdio add %+v", addedS)
 	}
 	if !strings.Contains(strings.Join(addedS.Warnings, " "), "permissions") {
 		t.Fatal("stdio permission warning missing")
+	}
+	// --env values go to the keyring: config.json and the --json output only carry the names.
+	if addedS.Service.Source.Env != nil {
+		t.Fatalf("env values in the --json output: %+v", addedS.Service.Source)
+	}
+	if raw, _ := readFile(config.Path(e.dir)); strings.Contains(raw, "greeting-s3cret-value") || !strings.Contains(raw, `"envNames": [`) {
+		t.Fatalf("env value in config.json, or names missing:\n%s", raw)
+	}
+	if v, err := e.store.Get("stdio-env/tools/TINY_GREETING"); err != nil || v != "greeting-s3cret-value" {
+		t.Fatalf("env value in keyring: %q %v", v, err)
 	}
 	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "web %s", r.URL.Path) }))
 	defer web.Close()

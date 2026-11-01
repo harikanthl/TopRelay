@@ -109,6 +109,10 @@ export default {
       return resource ? resource.fetch(request, env, ctx) : text("not found", 404);
     }
 
+    // Empty segments and encoded slashes or backslashes would reach the agent as a different path than the one
+    // routed here (`//host/x` even parses as a host), so they're refused outright.
+    if (url.pathname.includes("//") || /%2f|%5c/i.test(url.pathname)) return text("bad path", 400);
+
     const service = config.services.get(segments[0] ?? "");
     if (!service) return text("not found", 404);
     const rest = segments.slice(1);

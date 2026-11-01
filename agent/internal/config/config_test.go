@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -18,7 +19,7 @@ func TestRoundTrip(t *testing.T) {
 		Services: []Service{
 			{Name: "notes", Kind: KindMCP, Gen: 2, Source: Source{Type: SourceMCPURL, URL: "http://127.0.0.1:7879/mcp"},
 				Tools: ToolPolicy{Allow: []string{"search"}, Deny: []string{"delete"}, Default: DefaultDeny}, UpstreamHeader: "X-Token"},
-			{Name: "tools", Kind: KindMCP, Gen: 1, Source: Source{Type: SourceStdio, Command: []string{"node", "s.js"}, Env: map[string]string{"A": "1"}, Cwd: "/tmp"}},
+			{Name: "tools", Kind: KindMCP, Gen: 1, Source: Source{Type: SourceStdio, Command: []string{"node", "s.js"}, EnvNames: []string{"A"}, Cwd: "/tmp"}},
 			{Name: "web", Kind: KindHTTP, Gen: 1, Source: Source{Type: SourceHTTP, URL: "http://127.0.0.1:8080"}, AllowPaths: []string{"/api"}},
 		},
 	}
@@ -107,5 +108,13 @@ func TestBadJSON(t *testing.T) {
 	os.WriteFile(Path(dir), []byte("{"), 0o600)
 	if _, err := Load(dir); err == nil {
 		t.Fatal("bad JSON accepted")
+	}
+}
+
+func TestSaveRefusesEnvValues(t *testing.T) {
+	c := &Config{Services: []Service{{Name: "tools", Kind: KindMCP, Gen: 1,
+		Source: Source{Type: SourceStdio, Command: []string{"x"}, Env: map[string]string{"TOKEN": "v"}}}}}
+	if err := Save(t.TempDir(), c); err == nil || !strings.Contains(err.Error(), "keyring") {
+		t.Fatalf("Save with env values: %v", err)
 	}
 }

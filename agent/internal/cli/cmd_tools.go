@@ -49,8 +49,12 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 	if err != nil {
 		return err
 	}
+	env, err := a.stdioEnv(s)
+	if err != nil {
+		return err
+	}
 	res := ToolsResult{Service: s.Name}
-	tools, lerr := a.listLocalTools(s, hv)
+	tools, lerr := a.listLocalTools(s, hv, env)
 	if lerr == nil {
 		res.Reachable = true
 	} else {

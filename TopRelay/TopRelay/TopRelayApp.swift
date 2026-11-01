@@ -6,6 +6,11 @@ import SwiftUI
 struct TopRelayApp: App {
     @State private var model = AppModel()
 
+    init() {
+        // Writing a token to an engine that already exited must fail with an error, not kill the app.
+        signal(SIGPIPE, SIG_IGN)
+    }
+
     var body: some Scene {
         MenuBarExtra {
             MenuBarView()

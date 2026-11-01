@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/harikanthl/toprelay/agent/internal/httpfwd"
 	"github.com/harikanthl/toprelay/agent/internal/reqctx"
 )
 
@@ -50,7 +51,13 @@ func (p *Proxy) transport() http.RoundTripper {
 }
 
 func (p *Proxy) upstreamURL(r *http.Request) (*url.URL, bool) {
-	sub, ok := strings.CutPrefix(r.URL.Path, "/mcp")
+	// The tunnel decodes %2F and %2E, so clean the decoded path and refuse dot segments: /mcp/..%2Fadmin must
+	// not become /mcp/../admin upstream.
+	clean, ok := httpfwd.CleanPath(r.URL.Path)
+	if !ok {
+		return nil, false
+	}
+	sub, ok := strings.CutPrefix(clean, "/mcp")
 	if !ok || (sub != "" && sub[0] != '/') {
 		return nil, false
 	}
@@ -104,9 +111,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if d.Refuse {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set(RefusedHeader, strings.Join(d.Tools, ","))
+		w.Header().Set(RefusedHeader, d.RefusedLabel())
 		w.Header().Set("Content-Length", strconv.Itoa(len(d.Body)))
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(d.Status)
 		w.Write(d.Body)
 		return
 	}

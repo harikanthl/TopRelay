@@ -57,10 +57,12 @@ async function openConsent(clientId: string, challenge: string, resource = RESOU
   return { html, cookie: cookiesFrom(res), handle: html.match(/name="handle" value="([^"]+)"/)![1] };
 }
 
-const submit = (cookie: string, fields: Record<string, string>) =>
+// Each submit comes from its own IP, so tests don't share the per-IP pairing limit.
+let ipCounter = 0;
+const submit = (cookie: string, fields: Record<string, string>, ip = `198.51.100.${++ipCounter % 250}`) =>
   call("/authorize", {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", cookie },
+    headers: { "content-type": "application/x-www-form-urlencoded", cookie, "cf-connecting-ip": ip },
     body: new URLSearchParams(fields),
     redirect: "manual",
   });
@@ -110,8 +112,13 @@ describe("consent page", () => {
     const consent = await openConsent(clientId, (await pkce()).challenge);
     const wrong = await submit(consent.cookie, { handle: consent.handle, service: "notes", code: "wrong-code", decision: "approve" });
     expect(wrong.status).toBe(403);
-    expect(await wrong.text()).toContain("pairing code is wrong");
-    const right = await submit(consent.cookie, { handle: consent.handle, service: "notes", code: "right-code-1234", decision: "approve" });
+    const html = await wrong.text();
+    expect(html).toContain("pairing code is wrong");
+    // The page comes back with a fresh handle, so the owner can retry without starting over.
+    const handle = html.match(/name="handle" value="([^"]+)"/)![1];
+    expect(handle).not.toBe(consent.handle);
+    const cookie = [consent.cookie, cookiesFrom(wrong)].filter(Boolean).join("; ");
+    const right = await submit(cookie, { handle, service: "notes", code: "right-code-1234", decision: "approve" });
     expect(right.status).toBe(302);
     expect(new URL(right.headers.get("location")!).searchParams.get("code")).toBeTruthy();
   });
@@ -142,6 +149,19 @@ describe("consent page", () => {
     const consent = await openConsent(clientId, (await pkce()).challenge);
     const res = await submit(consent.cookie, { handle: consent.handle, service: "files", code: "files-code-123", decision: "approve" });
     expect(res.status).toBe(400);
+  });
+
+  it("doesn't let a request without a consent page spend pairing attempts", async () => {
+    await pair("notes", "owner-code-9999");
+    // A stranger floods POST /authorize with no handle or cookie.
+    for (let i = 0; i < 8; i++) {
+      const res = await submit("", { service: "notes", code: `guess-${i}-xxxx`, decision: "approve" });
+      expect(res.status).toBe(400);
+    }
+    const clientId = await register();
+    const consent = await openConsent(clientId, (await pkce()).challenge);
+    const res = await submit(consent.cookie, { handle: consent.handle, service: "notes", code: "owner-code-9999", decision: "approve" });
+    expect(res.status).toBe(302);
   });
 
   it("denies cleanly", async () => {

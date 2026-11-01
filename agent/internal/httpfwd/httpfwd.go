@@ -41,7 +41,8 @@ func New(base *url.URL, allow []string, headerName, headerValue string) *Forward
 			if r.Context().Err() != nil {
 				return
 			}
-			http.Error(w, "toprelay: the local service at "+f.Base.String()+" isn't answering. Ask its owner to check that it is running.", http.StatusBadGateway)
+			// No URL here: the body goes to the remote caller, and the base URL may carry credentials.
+			http.Error(w, "toprelay: the local service isn't answering. Ask its owner to check that it is running.", http.StatusBadGateway)
 		},
 	}
 	return f

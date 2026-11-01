@@ -247,16 +247,26 @@ func (e *DialError) Error() string {
 
 func (e *DialError) Unwrap() error { return e.Err }
 
+// WriteTimeout bounds one frame write; a socket that can't take a frame in this time is dropped.
+const WriteTimeout = 30 * time.Second
+
 type conn struct {
 	ws *websocket.Conn
+	// life is the socket's own context. Writes use it, never a request's: coder/websocket closes the whole
+	// connection when a write's context ends mid-write, so a cancel for one request would drop every other.
+	life context.Context
 }
 
+// send writes one frame unless ctx (the request's, or the socket's) has already ended.
 func (c *conn) send(ctx context.Context, v any) error {
+	if ctx.Err() != nil {
+		return errCancelled
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	wctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	wctx, cancel := context.WithTimeout(c.life, WriteTimeout)
 	defer cancel()
 	return c.ws.Write(wctx, websocket.MessageText, b)
 }
@@ -282,7 +292,7 @@ func (c *Client) session(ctx context.Context, wsURL string) (time.Duration, erro
 	}
 	defer ws.CloseNow()
 	ws.SetReadLimit(MaxFrame + 1<<16)
-	cn := &conn{ws: ws}
+	cn := &conn{ws: ws, life: ctx}
 
 	// The first hello carries the current allow-list, so drop change signals that arrived before it.
 	if c.o.HelloChanged != nil {
@@ -314,6 +324,7 @@ func (c *Client) session(ctx context.Context, wsURL string) (time.Duration, erro
 
 	sctx, scancel := context.WithCancelCause(ctx)
 	defer scancel(nil)
+	cn.life = sctx // before any goroutine writes
 	pong := make(chan struct{}, 1)
 	var wg sync.WaitGroup
 	defer wg.Wait()

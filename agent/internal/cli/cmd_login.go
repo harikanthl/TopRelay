@@ -102,7 +102,7 @@ The token is verified, then stored in the OS keyring (never in config.json).`)
 	if err := a.Store.Set(secrets.CloudflareToken, token); err != nil {
 		return wrap("keyring", "set TOPRELAY_KEYRING=file to use a file instead", err)
 	}
-	cfg, err := config.LoadOrEmpty(a.Dir)
+	cfg, err := config.LoadOrEmptyMigrated(a.Dir, a.Store)
 	if err != nil {
 		return wrap("config", "fix or delete "+config.Path(a.Dir), err)
 	}

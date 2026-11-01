@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/harikanthl/toprelay/agent/internal/secrets"
 )
 
 // Service kinds and source types.
@@ -48,11 +51,16 @@ type Service struct {
 
 // Source says where the local app is.
 type Source struct {
-	Type    string            `json:"type"`
-	URL     string            `json:"url,omitempty"`
-	Command []string          `json:"command,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	Cwd     string            `json:"cwd,omitempty"`
+	Type    string   `json:"type"`
+	URL     string   `json:"url,omitempty"`
+	Command []string `json:"command,omitempty"`
+	// EnvNames are the stdio child's extra environment variables; their values live in the keyring
+	// (secrets.StdioEnv).
+	EnvNames []string `json:"envNames,omitempty"`
+	// Env holds values only in memory (read from the keyring for a run) or in a config written by an older
+	// version, which MigrateEnv moves to the keyring. Save refuses to write it.
+	Env map[string]string `json:"env,omitempty"`
+	Cwd string            `json:"cwd,omitempty"`
 }
 
 // ToolPolicy decides which MCP tools are exposed: explicit allow and deny sets, plus a default for tools in
@@ -176,8 +184,72 @@ func LoadOrEmpty(dir string) (*Config, error) {
 	return c, err
 }
 
-// Save writes config.json atomically with mode 0600.
+// LoadMigrated is Load followed by MigrateEnv.
+func LoadMigrated(dir string, store secrets.Store) (*Config, error) {
+	c, err := Load(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := MigrateEnv(dir, c, store); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// LoadOrEmptyMigrated is LoadOrEmpty followed by MigrateEnv.
+func LoadOrEmptyMigrated(dir string, store secrets.Store) (*Config, error) {
+	c, err := LoadOrEmpty(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := MigrateEnv(dir, c, store); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// MigrateEnv moves stdio environment values that an older version wrote into config.json to the keyring, keeps
+// only their names, and rewrites the config. It does nothing when no service has values.
+func MigrateEnv(dir string, c *Config, store secrets.Store) error {
+	changed := false
+	for i := range c.Services {
+		s := &c.Services[i]
+		if len(s.Source.Env) == 0 {
+			if s.Source.Env != nil {
+				s.Source.Env, changed = nil, true
+			}
+			continue
+		}
+		for _, k := range slices.Sorted(maps.Keys(s.Source.Env)) {
+			if err := store.Set(secrets.StdioEnv(s.Name, k), s.Source.Env[k]); err != nil {
+				return fmt.Errorf("move %s's environment variable %s to the keyring: %w", s.Name, k, err)
+			}
+			if !slices.Contains(s.Source.EnvNames, k) {
+				s.Source.EnvNames = append(s.Source.EnvNames, k)
+			}
+		}
+		slices.Sort(s.Source.EnvNames)
+		s.Source.Env, changed = nil, true
+	}
+	if !changed {
+		return nil
+	}
+	if err := Save(dir, c); err != nil {
+		return fmt.Errorf("rewrite the config without environment values: %w", err)
+	}
+	return nil
+}
+
+// ErrEnvValues means a config with stdio environment values was about to be written.
+var ErrEnvValues = errors.New("stdio environment values belong in the keyring, not config.json")
+
+// Save writes config.json atomically with mode 0600. It refuses a config that carries stdio environment values.
 func Save(dir string, c *Config) error {
+	for _, s := range c.Services {
+		if len(s.Source.Env) > 0 {
+			return fmt.Errorf("service %s: %w", s.Name, ErrEnvValues)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}

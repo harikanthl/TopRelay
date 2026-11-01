@@ -2,6 +2,7 @@
 // from state.json (written by `toprelay up`); relay-side numbers come from `toprelay status`.
 
 import AppKit
+import Darwin
 import Foundation
 import Observation
 
@@ -27,6 +28,8 @@ final class AppModel {
         case needsLogin
         /// Signed in; may have zero services.
         case ready
+        /// The engine answered with an error we can't recover from on our own (shown with a Retry button).
+        case failed(EngineFailure)
     }
 
     enum Health: Equatable {
@@ -97,16 +100,26 @@ final class AppModel {
 
     /// Reads state.json. Cheap: called on every directory change.
     func readState() {
-        keepsRunning = EnginePaths.installedAgentExecutable() != nil
+        let installed = EnginePaths.installedAgentExecutable() != nil
+        if installed != keepsRunning { keepsRunning = installed }
         guard let data = try? Data(contentsOf: EnginePaths.stateFile),
               let state = try? JSONDecoder().decode(DaemonState.self, from: data) else {
             if daemon != nil { daemon = nil }
             return
         }
-        // A state file left by a process that is gone says "running" forever; trust the pid.
-        let alive = state.running && kill(pid_t(state.pid), 0) == 0
+        // A state file left by a process that is gone says "running" forever; check that the pid is alive and is
+        // really the engine (a pid can be reused by another of the user's processes after a crash).
+        let alive = state.running && Self.isEngineProcess(pid: state.pid)
         let effective = alive ? state : DaemonState(pid: state.pid, startedAt: state.startedAt, updatedAt: state.updatedAt, running: false, services: state.services)
         if effective != daemon { daemon = effective }
+    }
+
+    nonisolated static func isEngineProcess(pid: Int) -> Bool {
+        guard pid > 0, kill(pid_t(pid), 0) == 0 else { return false }
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let length = proc_pidpath(pid_t(pid), &buffer, UInt32(buffer.count))
+        guard length > 0 else { return false }
+        return URL(fileURLWithPath: String(cString: buffer)).lastPathComponent == "toprelay"
     }
 
     /// Reloads the service list (local config only, no network).
@@ -117,14 +130,15 @@ final class AppModel {
             list = result
             phase = result.accountId.isEmpty ? .needsLogin : .ready
             lastError = nil
+            if (result.services ?? []).isEmpty { status = nil }
         } catch let failure as EngineFailure where ["no_config", "not_logged_in"].contains(failure.code) {
             list = nil
             phase = .needsLogin
-        } catch let failure as EngineFailure {
-            lastError = failure
-            if phase == .loading { phase = .needsLogin }
         } catch {
-            lastError = EngineFailure(code: "error", message: error.localizedDescription)
+            let failure = error.asFailure
+            lastError = failure
+            // Only a fresh start falls back to the error screen; once running, keep showing the last good list.
+            if list == nil { phase = .failed(failure) }
         }
     }
 
@@ -133,7 +147,7 @@ final class AppModel {
         guard let engine, phase == .ready, !services.isEmpty, !isRefreshingStatus else { return }
         isRefreshingStatus = true
         defer { isRefreshingStatus = false }
-        if let result: StatusResult = try? await engine.run(["status"]) {
+        if let result: StatusResult = try? await engine.run(["status"], timeout: 45) {
             status = result
         }
     }
@@ -142,16 +156,20 @@ final class AppModel {
 
     func setKeepsRunning(_ on: Bool) async throws {
         guard let engine else { return }
-        let _: InstallResult = try await engine.run(["up", on ? "--install" : "--uninstall"])
+        if on && EnginePaths.isTranslocated {
+            throw EngineFailure(code: "translocated",
+                                message: "TopRelay is running from a temporary copy that macOS removes when it quits.",
+                                fix: "Move TopRelay to your Applications folder, open it from there, and try again.")
+        }
+        let _: InstallResult = try await engine.run(["up", on ? "--install" : "--uninstall"], timeout: 30)
         readState()
     }
 
     /// The login item points at the engine inside this app. If the app was moved (or updated in place to a new
     /// path), reinstall so it points at this copy.
     private func repairLoginItemIfMoved() async {
-        guard let engine, let installed = EnginePaths.installedAgentExecutable() else { return }
-        let current = engine.executable.resolvingSymlinksInPath().path
-        if installed != current {
+        guard let engine, !EnginePaths.isTranslocated, let installed = EnginePaths.installedAgentExecutable() else { return }
+        if EnginePaths.canonical(installed) != EnginePaths.canonical(engine.executable.path) {
             try? await setKeepsRunning(true)
         }
     }
@@ -187,7 +205,7 @@ final class AppModel {
             if let cwd, !cwd.isEmpty { args += ["--cwd", cwd] }
             args += ["--"] + command
         }
-        let result: AddResult = try await engine.run(args)
+        let result: AddResult = try await engine.run(args, timeout: 180)
         await reload()
         await refreshStatus()
         return result
@@ -195,14 +213,14 @@ final class AppModel {
 
     func remove(_ service: String) async throws {
         guard let engine else { return }
-        let _: RemoveResult = try await engine.run(["remove", service])
+        let _: RemoveResult = try await engine.run(["remove", service], timeout: 180)
         await reload()
         await refreshStatus()
     }
 
     func rotate(_ service: String) async throws -> RotateResult {
         guard let engine else { throw EngineFailure(code: "engine_missing", message: "TopRelay's engine is missing.") }
-        let result: RotateResult = try await engine.run(["rotate", service])
+        let result: RotateResult = try await engine.run(["rotate", service], timeout: 180)
         await reload()
         return result
     }
@@ -239,12 +257,12 @@ final class AppModel {
 
     func test(_ service: String) async throws -> TestResult {
         guard let engine else { throw EngineFailure(code: "engine_missing", message: "TopRelay's engine is missing.") }
-        return try await engine.run(["test", service])
+        return try await engine.run(["test", service], timeout: 120)
     }
 
     func doctor() async throws -> DoctorResult {
         guard let engine else { throw EngineFailure(code: "engine_missing", message: "TopRelay's engine is missing.") }
-        return try await engine.run(["doctor"])
+        return try await engine.run(["doctor"], timeout: 150)
     }
 
     // MARK: Helpers
@@ -254,11 +272,28 @@ final class AppModel {
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    /// Reads the most recent calls from the local call log (newest first).
+    /// Reads the most recent calls from the local call log (newest first). Reads only the end of the file, and
+    /// the rotated `.1` file when the current one is short (right after rotation).
     nonisolated static func recentCalls(service: String, limit: Int = 200) -> [CallRecord] {
-        guard let data = try? Data(contentsOf: EnginePaths.logFile(for: service)) else { return [] }
+        let current = EnginePaths.logFile(for: service)
+        var lines = tailLines(of: current, limit: limit)
+        if lines.count < limit {
+            let rotated = current.appendingPathExtension("1")
+            lines = tailLines(of: rotated, limit: limit - lines.count) + lines
+        }
         let decoder = JSONDecoder()
-        let lines = data.split(separator: UInt8(ascii: "\n")).suffix(limit)
-        return lines.compactMap { try? decoder.decode(CallRecord.self, from: Data($0)) }.reversed()
+        return lines.compactMap { try? decoder.decode(CallRecord.self, from: $0) }.reversed()
+    }
+
+    /// The last `limit` complete lines of a file, reading at most 256 KiB from its end.
+    nonisolated static func tailLines(of url: URL, limit: Int, maxBytes: UInt64 = 256 * 1024) -> [Data] {
+        guard limit > 0, let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return [] }
+        let start = size > maxBytes ? size - maxBytes : 0
+        guard (try? handle.seek(toOffset: start)) != nil, let chunk = try? handle.readToEnd() else { return [] }
+        var parts = chunk.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
+        if start > 0, !parts.isEmpty { parts.removeFirst() } // the first line was cut in half
+        return parts.suffix(limit).map { Data($0) }
     }
 }

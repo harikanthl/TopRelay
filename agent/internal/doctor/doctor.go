@@ -84,7 +84,7 @@ func run(ctx context.Context, e Env) Report {
 	}
 	r := &runner{}
 
-	cfg, err := config.Load(e.Dir)
+	cfg, err := config.LoadMigrated(e.Dir, e.Store)
 	if err != nil {
 		r.add(Check{Name: "config", Status: Fail, Detail: err.Error(), Fix: "run `toprelay login`, then `toprelay add <name> …`"})
 		return r.r
@@ -274,7 +274,12 @@ func (r *runner) localCheck(ctx context.Context, e Env, s config.Service) {
 		}
 		r.add(Check{Name: name, Status: OK, Detail: toolSummary(tools, s.Tools)})
 	case config.SourceStdio:
-		tools, err := stdiobridge.ListChildTools(ctx, s.Source.Command, s.Source.Env, s.Source.Cwd)
+		env, err := secrets.LoadEnv(e.Store, s.Name, s.Source.EnvNames)
+		if err != nil {
+			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "remove and re-add the service with its --env values"})
+			return
+		}
+		tools, err := stdiobridge.ListChildTools(ctx, s.Source.Command, env, s.Source.Cwd)
 		if err != nil {
 			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "check the command runs on its own: " + strings.Join(s.Source.Command, " ")})
 			return

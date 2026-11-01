@@ -14,58 +14,107 @@ nonisolated struct Engine: Sendable {
         return Engine(executable: url, environment: EnginePaths.childEnvironment())
     }
 
-    /// Runs `toprelay --json <args>` and decodes the result, or throws the engine's own error.
-    func run<T: Decodable & Sendable>(_ args: [String], stdin: String? = nil, as type: T.Type = T.self) async throws -> T {
-        let (data, status) = try await execute(["--json"] + args, stdin: stdin)
+    /// Runs `toprelay --json <args>` and decodes the result, or throws the engine's own error. The engine is
+    /// stopped if it runs longer than `timeout` seconds or the calling task is cancelled.
+    func run<T: Decodable & Sendable>(_ args: [String], stdin: String? = nil, timeout: TimeInterval = 60, as type: T.Type = T.self) async throws -> T {
+        let outcome = try await execute(["--json"] + args, stdin: stdin, timeout: timeout)
+        if outcome.timedOut {
+            throw EngineFailure(code: "timeout", message: "The engine took longer than \(Int(timeout)) seconds and was stopped.",
+                                fix: "Check your network, then try again. `toprelay doctor` in Terminal shows more.")
+        }
         let decoder = JSONDecoder()
-        if let failure = try? decoder.decode(FailureEnvelope.self, from: data) { throw failure.error }
+        if let failure = try? decoder.decode(FailureEnvelope.self, from: outcome.data) { throw failure.error }
         do {
-            return try decoder.decode(T.self, from: data)
+            return try decoder.decode(T.self, from: outcome.data)
         } catch {
-            let text = String(decoding: data.prefix(400), as: UTF8.self)
+            let text = String(decoding: outcome.data.prefix(400), as: UTF8.self)
             throw EngineFailure(
                 code: "bad_output",
-                message: status == 0 ? "The engine's answer couldn't be read." : "The engine stopped with an error (exit \(status)).",
+                message: outcome.status == 0 ? "The engine's answer couldn't be read." : "The engine stopped with an error (exit \(outcome.status)).",
                 fix: text.isEmpty ? "Run `toprelay doctor` in Terminal for details." : text
             )
         }
     }
 
+    private struct Outcome: Sendable {
+        let data: Data
+        let status: Int32
+        let timedOut: Bool
+    }
+
+    /// Holds the running process so a timeout or a cancelled task can stop it from another thread.
+    private final class Running: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        private var timedOut = false
+        private var stopped = false
+
+        func set(_ process: Process) -> Bool {
+            lock.withLock {
+                self.process = process
+                return !stopped
+            }
+        }
+
+        func stop(timedOut: Bool) {
+            lock.withLock {
+                stopped = true
+                if timedOut { self.timedOut = true }
+                if let process, process.isRunning { process.terminate() }
+            }
+        }
+
+        var didTimeOut: Bool { lock.withLock { timedOut } }
+    }
+
     /// Runs the engine and returns stdout and the exit status. Stdout is read on a background queue while the
     /// process runs, so a large answer can't fill the pipe and stall it. Stderr carries only human notes in
-    /// --json mode and is discarded.
-    private func execute(_ args: [String], stdin: String?) async throws -> (Data, Int32) {
+    /// --json mode and is discarded. The engine's own children get their own pipes, so once it exits (or is
+    /// terminated) stdout reaches end of file.
+    private func execute(_ args: [String], stdin: String?, timeout: TimeInterval) async throws -> Outcome {
         let executable = self.executable
         let environment = self.environment
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = executable
-                process.arguments = args
-                process.environment = environment
-                let out = Pipe()
-                process.standardOutput = out
-                process.standardError = FileHandle.nullDevice
-                let input = Pipe()
-                process.standardInput = stdin == nil ? FileHandle.nullDevice : input
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: EngineFailure(
-                        code: "engine_missing",
-                        message: "TopRelay's engine couldn't start.",
-                        fix: "Reinstall TopRelay. (\(error.localizedDescription))"
-                    ))
-                    return
+        let running = Running()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Outcome, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let process = Process()
+                    process.executableURL = executable
+                    process.arguments = args
+                    process.environment = environment
+                    let out = Pipe()
+                    process.standardOutput = out
+                    process.standardError = FileHandle.nullDevice
+                    let input = Pipe()
+                    process.standardInput = stdin == nil ? FileHandle.nullDevice : input
+                    guard running.set(process) else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        try process.run()
+                    } catch {
+                        continuation.resume(throwing: EngineFailure(
+                            code: "engine_missing",
+                            message: "TopRelay's engine couldn't start.",
+                            fix: "Reinstall TopRelay. (\(error.localizedDescription))"
+                        ))
+                        return
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { running.stop(timedOut: true) }
+                    if let stdin {
+                        // SIGPIPE is ignored app-wide (TopRelayApp.init), so an engine that exits early makes this
+                        // throw instead of killing the app.
+                        try? input.fileHandleForWriting.write(contentsOf: Data(stdin.utf8))
+                        try? input.fileHandleForWriting.close()
+                    }
+                    let data = out.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    continuation.resume(returning: Outcome(data: data, status: process.terminationStatus, timedOut: running.didTimeOut))
                 }
-                if let stdin {
-                    input.fileHandleForWriting.write(Data(stdin.utf8))
-                    try? input.fileHandleForWriting.close()
-                }
-                let data = out.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                continuation.resume(returning: (data, process.terminationStatus))
             }
+        } onCancel: {
+            running.stop(timedOut: false)
         }
     }
 }
@@ -95,6 +144,18 @@ nonisolated enum EnginePaths {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/dev.toprelay.agent.plist")
     }
+
+    /// The canonical path of a file: symlinks resolved and /tmp → /private/tmp, the same answer Go's
+    /// filepath.EvalSymlinks gives. (URL.resolvingSymlinksInPath strips /private, which Go keeps.)
+    static func canonical(_ path: String) -> String {
+        guard let resolved = realpath(path, nil) else { return path }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
+    /// macOS runs apps opened straight from Downloads (still quarantined) from a temporary, randomized copy.
+    /// A login item pointing there breaks after the app quits.
+    static var isTranslocated: Bool { Bundle.main.bundlePath.contains("/AppTranslocation/") }
 
     /// The program path the installed login item runs, if it is installed.
     static func installedAgentExecutable() -> String? {

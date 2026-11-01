@@ -5,16 +5,20 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./config";
 import { MAX_BODY } from "./config";
-import { GcraLimiter, PAIR_LIMIT, REQUEST_LIMIT } from "./gcra";
+import { GcraLimiter, PAIR_GLOBAL_LIMIT, PAIR_LIMIT, REQUEST_LIMIT } from "./gcra";
 import { filterResponseHeaders, forwardedRequestHeaders, INTERNAL } from "./headers";
 import { stringsEqual } from "./keys";
+import type { RpcInfo } from "./mcp";
 import { disallowedText, offlineText, parseRpc, rpcError, toolError } from "./mcp";
 
 export const START_TIMEOUT_MS = 120_000;
 export const STREAM_IDLE_MS = 300_000;
 export const TOTAL_TIMEOUT_MS = 840_000;
 const MAX_REVOKED = 10_000;
-const FLUSH_DELAY_MS = 60_000;
+/** Usage is flushed this long after activity, before the object can hibernate (about 10 s idle) and lose it. */
+const FLUSH_DELAY_MS = 5_000;
+/** A streamed reply may queue this much for a slow bot before it's cut off (v1 has no flow-control credit). */
+export const STREAM_BUFFER_LIMIT = 8 * 1024 * 1024;
 
 interface Hello {
   agent: string;
@@ -32,8 +36,8 @@ interface Pending {
   ws: WebSocket;
   service: string;
   kind: string;
-  body: Uint8Array;
-  contentType: string | null;
+  /** Only the JSON-RPC id and method are kept for the offline answer, never the body. */
+  rpc: RpcInfo;
   mcpMethod: string | null;
   started: boolean;
   settled: boolean;
@@ -60,6 +64,8 @@ const stopTimer = (timer: number | undefined) => {
 };
 
 const today = (now: number) => new Date(now).toISOString().slice(0, 10);
+
+const emptyUsage = (day: string): Usage => ({ day, requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 });
 
 function b64ToBytes(text: string): Uint8Array {
   const bin = atob(text);
@@ -114,15 +120,18 @@ export class Relay extends DurableObject<Env> {
   private readonly pending = new Map<string, Pending>();
   private readonly requestLimiter = new GcraLimiter(REQUEST_LIMIT);
   private readonly pairLimiter = new GcraLimiter(PAIR_LIMIT);
+  private readonly pairGlobalLimiter = new GcraLimiter(PAIR_GLOBAL_LIMIT);
   private revoked: Set<string>;
-  private usage: Usage;
+  /** Counts since the last flush. Added to the stored row on flush, so a restart or hibernation loses at most
+   * the few seconds before FLUSH_DELAY_MS, and never overwrites newer stored numbers with older ones. */
+  private delta: Usage;
   private flushScheduled = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
     this.revoked = new Set(this.getJson<string[]>("revoked") ?? []);
-    this.usage = this.getJson<Usage>("usage") ?? { day: today(Date.now()), requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 };
+    this.delta = emptyUsage(today(Date.now()));
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
@@ -146,16 +155,46 @@ export class Relay extends DurableObject<Env> {
   private count(field: "requests" | "rejected" | "bytesIn" | "bytesOut", amount = 1) {
     const now = Date.now();
     const day = today(now);
-    if (this.usage.day !== day) this.usage = { day, requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 };
-    this.usage[field] += amount;
+    if (this.delta.day !== day) {
+      this.flushUsage();
+      this.delta = emptyUsage(day);
+    }
+    this.delta[field] += amount;
     if (!this.flushScheduled) {
       this.flushScheduled = true;
       this.ctx.storage.setAlarm(now + FLUSH_DELAY_MS);
     }
   }
 
+  /** Today's totals: what's stored plus what hasn't been flushed yet. */
+  private usageToday(now: number): Usage {
+    const day = today(now);
+    const stored = this.getJson<Usage>("usage");
+    const base = stored && stored.day === day ? stored : emptyUsage(day);
+    if (this.delta.day !== day) return base;
+    return {
+      day,
+      requests: base.requests + this.delta.requests,
+      rejected: base.rejected + this.delta.rejected,
+      bytesIn: base.bytesIn + this.delta.bytesIn,
+      bytesOut: base.bytesOut + this.delta.bytesOut,
+    };
+  }
+
   private flushUsage() {
-    this.putJson("usage", this.usage);
+    const d = this.delta;
+    if (d.requests || d.rejected || d.bytesIn || d.bytesOut) {
+      const stored = this.getJson<Usage>("usage");
+      const base = stored && stored.day === d.day ? stored : emptyUsage(d.day);
+      this.putJson("usage", {
+        day: d.day,
+        requests: base.requests + d.requests,
+        rejected: base.rejected + d.rejected,
+        bytesIn: base.bytesIn + d.bytesIn,
+        bytesOut: base.bytesOut + d.bytesOut,
+      } satisfies Usage);
+    }
+    this.delta = emptyUsage(d.day);
     this.flushScheduled = false;
   }
 
@@ -281,10 +320,13 @@ export class Relay extends DurableObject<Env> {
     const headers = filterResponseHeaders(frame.headers as Record<string, unknown>);
     p.started = true;
     stopTimer(p.startTimer);
-    p.body = new Uint8Array(0);
 
     if (frame.stream === true) {
-      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>(
+        {},
+        new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 }),
+        new ByteLengthQueuingStrategy({ highWaterMark: STREAM_BUFFER_LIMIT }),
+      );
       p.writer = writable.getWriter();
       // The bot went away: the readable side is cancelled and writes start failing.
       p.writer.closed.catch(() => this.cancel(id, true));
@@ -320,6 +362,9 @@ export class Relay extends DurableObject<Env> {
     this.count("bytesOut", bytes.byteLength);
     this.resetIdle(frame.id as string, p);
     p.writer.write(bytes).catch(() => this.cancel(frame.id as string, true));
+    // The bot reads slower than the agent sends. Without flow control the only safe answer is to stop, before the
+    // queue eats the object's memory and takes every other request down with it.
+    if ((p.writer.desiredSize ?? 0) < -STREAM_BUFFER_LIMIT) this.cancel(frame.id as string, false);
   }
 
   private onEnd(ws: WebSocket, frame: Record<string, unknown>) {
@@ -353,8 +398,8 @@ export class Relay extends DurableObject<Env> {
       // socket already gone
     }
     if (!p.started) p.resolve(new Response("the service took too long to answer", { status: botGone ? 499 : 504 }));
-    else if (botGone) p.writer?.abort(new Error("cancelled")).catch(() => {});
-    else p.writer?.close().catch(() => {});
+    // A started stream that is cut short is aborted, never closed, so the bot can't mistake it for a full reply.
+    else p.writer?.abort(new Error(botGone ? "cancelled" : "stream stopped by the relay")).catch(() => {});
   }
 
   private settle(id: string, p: Pending) {
@@ -374,12 +419,11 @@ export class Relay extends DurableObject<Env> {
     }
   }
 
-  private offlineAnswer(p: Pick<Pending, "service" | "kind" | "body" | "contentType" | "mcpMethod">): Response {
+  private offlineAnswer(p: Pick<Pending, "service" | "kind" | "rpc" | "mcpMethod">): Response {
     const text = offlineText(p.service);
     if (p.kind !== "mcp") return new Response(text, { status: 503, headers: { "content-type": "text/plain; charset=utf-8", "retry-after": "30" } });
-    const rpc = parseRpc(p.body, p.contentType);
-    const method = p.mcpMethod ?? rpc.method;
-    return method === "tools/call" ? toolError(rpc.id, text) : rpcError(rpc.id, -32000, text, 503);
+    const method = p.mcpMethod ?? p.rpc.method;
+    return method === "tools/call" ? toolError(p.rpc.id, text) : rpcError(p.rpc.id, -32000, text, 503);
   }
 
   // ── relaying a request ────────────────────────────────────────────────────────────────────────────────────────
@@ -416,6 +460,7 @@ export class Relay extends DurableObject<Env> {
 
     const contentType = h.get("content-type");
     const mcpMethod = kind === "mcp" ? h.get("mcp-method") : null;
+    const rpc: RpcInfo = kind === "mcp" ? parseRpc(body, contentType) : { id: null };
     const keyTools = h.get(INTERNAL.tools) ? (JSON.parse(h.get(INTERNAL.tools)!) as string[]) : undefined;
     const agent = this.agentSocket();
 
@@ -427,13 +472,13 @@ export class Relay extends DurableObject<Env> {
       const allowedByKey = keyTools === undefined || keyTools.includes(toolName);
       if (!allowedByAgent || !allowedByKey) {
         this.count("rejected");
-        return toolError(parseRpc(body, contentType).id, disallowedText(service, toolName));
+        return toolError(rpc.id, disallowedText(service, toolName));
       }
     }
 
     if (!agent?.attachment.hello) {
       this.count("rejected");
-      return this.offlineAnswer({ service, kind, body, contentType, mcpMethod });
+      return this.offlineAnswer({ service, kind, rpc, mcpMethod });
     }
     this.count("requests");
 
@@ -455,8 +500,7 @@ export class Relay extends DurableObject<Env> {
         ws: agent.ws,
         service,
         kind,
-        body,
-        contentType,
+        rpc,
         mcpMethod,
         started: false,
         settled: false,
@@ -479,8 +523,7 @@ export class Relay extends DurableObject<Env> {
 
   private status(request: Request): Response {
     const agent = this.agentSocket();
-    const day = today(Date.now());
-    const usage = this.usage.day === day ? this.usage : { day, requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 };
+    const usage = this.usageToday(Date.now());
     return json({
       service: request.headers.get(INTERNAL.service) ?? "",
       connected: Boolean(agent?.attachment.hello),
@@ -503,8 +546,16 @@ export class Relay extends DurableObject<Env> {
   }
 
   private async verifyPairing(request: Request): Promise<Response> {
-    const limited = this.pairLimiter.take("pair", Date.now());
-    if (!limited.ok) return json({ ok: false, reason: "too_many_attempts", retryAfter: Math.ceil(limited.retryAfterMs / 1000) });
+    // Per caller IP, so one noisy client can't lock the owner out, plus a looser cap for the whole service.
+    // A 12-character code from a 31-letter alphabet has about 59 bits; these limits keep guessing hopeless.
+    const now = Date.now();
+    const ip = request.headers.get(INTERNAL.ip) || "unknown";
+    const limited = this.pairLimiter.take(`ip:${ip}`, now);
+    const global = limited.ok ? this.pairGlobalLimiter.take("all", now) : limited;
+    if (!limited.ok || !global.ok) {
+      const retry = !limited.ok ? limited.retryAfterMs : global.ok ? 0 : global.retryAfterMs;
+      return json({ ok: false, reason: "too_many_attempts", retryAfter: Math.ceil(retry / 1000) });
+    }
     const body = (await request.json().catch(() => null)) as { code?: unknown } | null;
     const pairing = this.getJson<{ hash: string; expires: number }>("pairing");
     if (!pairing || pairing.expires <= Math.floor(Date.now() / 1000)) return json({ ok: false, reason: "no_code" });

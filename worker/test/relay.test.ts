@@ -178,6 +178,50 @@ describe("relaying", () => {
     expect((await pending).status).toBe(200);
   });
 
+  it("refuses paths with empty segments or encoded slashes", async () => {
+    const key = await mintKey(["svc=files", "g=1"]);
+    for (const path of ["/files//host/x", "/files/a%2f..%2fetc", "/files/a%5Cb"]) {
+      expect((await call(path, { headers: { authorization: `Bearer ${key}` } })).status, path).toBe(400);
+    }
+  });
+
+  it("cuts off a stream the bot isn't reading before it fills memory", async () => {
+    const a = await agent("files");
+    const pending = call("/files/big", { headers: { authorization: `Bearer ${await mintKey(["svc=files", "g=1"])}` } });
+    const req = await a.nextRequest();
+    a.send({ type: "response", id: req.id, status: 200, headers: { "content-type": "application/octet-stream" }, stream: true });
+    const res = await pending;
+    const chunk = btoa("x".repeat(1024 * 1024));
+    for (let i = 0; i < 24; i++) a.send({ type: "chunk", id: req.id, data: chunk });
+    await a.until(() => a.cancels.includes(req.id), 10000);
+    // The bot gets a broken stream, not a clean end: a truncated reply must never look complete.
+    let received = 0;
+    let failed = false;
+    try {
+      const reader = res.body!.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+      }
+    } catch {
+      failed = true;
+    }
+    expect(failed).toBe(true);
+    expect(received).toBeLessThan(24 * 1024 * 1024);
+  }, 20000);
+
+  it("drops response headers workerd can't accept instead of hanging", async () => {
+    const a = await agent("files");
+    const pending = call("/files/x", { headers: { authorization: `Bearer ${await mintKey(["svc=files", "g=1"])}` } });
+    const req = await a.nextRequest();
+    a.send({ type: "response", id: req.id, status: 200, headers: { etag: "a\u0000b", "content-type": "text/plain" }, body: b64("ok") });
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(res.headers.get("etag")).toBeNull();
+    expect(await res.text()).toBe("ok");
+  });
+
   it("rejects oversized bodies before forwarding", async () => {
     const a = await agent("files");
     const big = new Uint8Array(20 * 1024 * 1024 + 1);

@@ -21,6 +21,14 @@ struct MainWindow: View {
                 SetupView()
             case .ready:
                 ReadyView()
+            case .failed(let failure):
+                VStack(spacing: 14) {
+                    ErrorBanner(failure: failure)
+                    Button("Try again") { Task { await model.reload() } }
+                        .buttonStyle(PressableStyle(prominent: true))
+                }
+                .frame(maxWidth: 440)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(minWidth: 760, minHeight: 520)
@@ -198,6 +206,7 @@ struct SetupView: View {
         action.perform {
             do {
                 signedIn = try await model.login(token: token)
+                self.token = ""
                 go(.done)
             } catch let failure as EngineFailure where failure.code == "choose_account" {
                 accounts = failure.accounts ?? []
@@ -225,6 +234,7 @@ struct SetupView: View {
                     let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
                     action.perform {
                         signedIn = try await model.login(token: token, account: account)
+                        self.token = ""
                         go(.done)
                     }
                 }

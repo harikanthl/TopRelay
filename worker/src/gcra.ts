@@ -32,5 +32,7 @@ export class GcraLimiter {
 
 /** 20 requests/s sustained, burst 60 (docs/protocol.md "Limits"). */
 export const REQUEST_LIMIT: Gcra = { interval: 50, burst: 60 };
-/** Pairing-code attempts: 5 at once, then one every 2 minutes. */
+/** Pairing-code attempts per caller IP: 5 at once, then one every 2 minutes. */
 export const PAIR_LIMIT: Gcra = { interval: 120_000, burst: 5 };
+/** Pairing-code attempts for a whole service, from every IP together: 30 at once, then one every 20 seconds. */
+export const PAIR_GLOBAL_LIMIT: Gcra = { interval: 20_000, burst: 30 };

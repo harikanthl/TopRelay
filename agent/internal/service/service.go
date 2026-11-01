@@ -112,6 +112,14 @@ func (rt *Runtime) addKnown(names []string) {
 
 // Hello is the hello announced for this service.
 func (rt *Runtime) Hello() tunnel.Hello {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.helloLocked()
+}
+
+// helloLocked computes the hello; rt.mu must be held. (It may take the bridge's lock: the order is always rt.mu,
+// then the bridge's, and the bridge calls notify only after releasing its own.)
+func (rt *Runtime) helloLocked() tunnel.Hello {
 	p := rt.Policy()
 	if rt.Svc.Kind == config.KindHTTP {
 		return tunnel.Hello{Kind: config.KindHTTP, AllowAll: true}
@@ -122,17 +130,16 @@ func (rt *Runtime) Hello() tunnel.Hello {
 	if rt.bridge != nil {
 		return tunnel.Hello{Kind: config.KindMCP, Tools: rt.bridge.Exposed()}
 	}
-	rt.mu.Lock()
-	known := slices.Clone(rt.known)
-	rt.mu.Unlock()
 	// Explicitly allowed tools are always listed, even before the upstream has been seen.
-	return tunnel.Hello{Kind: config.KindMCP, Tools: p.AllowList(append(known, p.Allow...))}
+	return tunnel.Hello{Kind: config.KindMCP, Tools: p.AllowList(append(slices.Clone(rt.known), p.Allow...))}
 }
 
-// notify signals a hello change when the hello differs from the last one.
+// notify signals a hello change when the hello differs from the last one. Computing and comparing under one lock
+// keeps lastHello equal to the newest hello, so concurrent callers can't leave a stale one that would suppress a
+// later, needed signal.
 func (rt *Runtime) notify() {
-	h := rt.Hello()
 	rt.mu.Lock()
+	h := rt.helloLocked()
 	same := rt.lastHello != nil && rt.lastHello.AllowAll == h.AllowAll && slices.Equal(rt.lastHello.Tools, h.Tools)
 	if !same {
 		rt.lastHello = &h

@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"slices"
+	"strings"
 )
 
 // Message is the part of a JSON-RPC message the proxy looks at.
@@ -18,13 +20,15 @@ type Message struct {
 	Error  json.RawMessage `json:"error,omitempty"`
 }
 
-// ToolName returns params.name for a tools/call.
+// ToolName returns params.name for a tools/call ("" when it is missing or not a string).
 func (m Message) ToolName() string {
 	var p struct {
 		Name string `json:"name"`
 	}
 	if len(m.Params) > 0 {
-		_ = json.Unmarshal(m.Params, &p)
+		if json.Unmarshal(m.Params, &p) != nil {
+			return ""
+		}
 	}
 	return p.Name
 }
@@ -39,11 +43,18 @@ func IDKey(id json.RawMessage) string {
 	return string(b)
 }
 
-// Parse reads a JSON-RPC body: one message or a batch.
+// MissingToolName stands for the tool of a tools/call without a string params.name; such calls are always refused.
+const MissingToolName = "(missing name)"
+
+// Parse reads a JSON-RPC body: one message or a batch. It rejects bodies an exact-key JSON reader could read
+// differently (duplicate or case-variant keys, a BOM, trailing data); see checkStrict.
 func Parse(body []byte) (msgs []Message, batch bool, err error) {
 	t := bytes.TrimSpace(body)
 	if len(t) == 0 {
 		return nil, false, fmt.Errorf("empty body")
+	}
+	if err := checkStrict(body); err != nil {
+		return nil, t[0] == '[', err
 	}
 	if t[0] == '[' {
 		if err := json.Unmarshal(t, &msgs); err != nil {
@@ -203,25 +214,42 @@ func FilterBody(body []byte, listIDs map[string]bool, allowed Allowed) ([]byte, 
 
 // Decision is the guard's verdict on a request body.
 type Decision struct {
-	// Refuse is set when the request must be answered locally; Body is the answer.
+	// Refuse is set when the request must be answered locally; Body is the answer, with HTTP status Status.
 	Refuse bool
+	Status int
 	Body   []byte
-	Tools  []string // refused tool names
+	// Invalid is set when the body isn't a JSON-RPC message the guard can read safely (answered with -32700).
+	Invalid bool
+	Tools   []string // refused tool names
 	// ListIDs are the ids of tools/list requests, for filtering the response.
 	ListIDs map[string]bool
 	Msgs    []Message
 }
 
+// RefusedLabel is the RefusedHeader value for a refusal: the refused tools, or why the body was refused.
+func (d Decision) RefusedLabel() string {
+	if len(d.Tools) > 0 {
+		return strings.Join(d.Tools, ",")
+	}
+	return "(invalid request)"
+}
+
 // Decide applies the allow-list to a request body. headerName is the Mcp-Name header when Mcp-Method is
 // tools/call ("" otherwise).
 func Decide(body []byte, headerName, service string, allowed Allowed) Decision {
-	d := Decision{ListIDs: map[string]bool{}}
+	d := Decision{ListIDs: map[string]bool{}, Status: http.StatusOK}
 	msgs, batch, err := Parse(body)
 	if err != nil {
-		if headerName != "" && !allowed(headerName) {
-			d.Refuse, d.Tools = true, []string{headerName}
-			d.Body = Refusal(nil, headerName, service)
-		}
+		// Never forward what the guard can't read exactly as the app would.
+		d.Refuse, d.Invalid, d.Status = true, true, http.StatusBadRequest
+		d.Body, _ = json.Marshal(response{JSONRPC: "2.0", ID: json.RawMessage("null"),
+			Error: map[string]any{"code": -32700, "message": "Parse error: " + err.Error()}})
+		return d
+	}
+	if len(msgs) == 0 {
+		d.Refuse, d.Invalid, d.Status = true, true, http.StatusBadRequest
+		d.Body, _ = json.Marshal(response{JSONRPC: "2.0", ID: json.RawMessage("null"),
+			Error: map[string]any{"code": -32600, "message": "Invalid Request: empty batch"}})
 		return d
 	}
 	d.Msgs = msgs
@@ -231,7 +259,9 @@ func Decide(body []byte, headerName, service string, allowed Allowed) Decision {
 		switch m.Method {
 		case "tools/call":
 			name := m.ToolName()
-			if !allowed(name) {
+			if name == "" {
+				refused[i], anyRefused = MissingToolName, true
+			} else if !allowed(name) {
 				refused[i], anyRefused = name, true
 			} else if !batch && headerName != "" && headerName != name && !allowed(headerName) {
 				refused[i], anyRefused = headerName, true

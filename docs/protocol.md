@@ -145,6 +145,16 @@ Limits:
 - A streamed response with no chunk for **300 s** is ended.
 - No request lasts longer than **840 s** in total.
 - Rate limit, per service: GCRA at **20 requests/s, burst 60**. Over the limit gets `429` with `Retry-After`.
+- A streamed reply may queue at most about **8 MiB** for a bot that reads slowly. Past that the stream is
+  aborted and the agent gets `cancel` (v1 has no flow-control credit).
+- A stream cut short by a timeout or the queue limit is **aborted, never closed cleanly**, so a truncated reply
+  never looks complete.
+- Paths containing `//`, `%2F` or `%5C` (any case) get `400`, since they would reach the agent as a different
+  path than the one the relay routed.
+- Pairing attempts: **5 per caller IP**, then 1 every 2 minutes; and **30 per service** from all IPs, then 1
+  every 20 s. A `POST /authorize` is checked against its consent session (handle and cookie) **before** the code
+  is, so a request without a real consent page uses up neither attempts nor the code. A wrong code shows the
+  page again with a fresh handle.
 
 ### MCP-aware answers in the Durable Object
 

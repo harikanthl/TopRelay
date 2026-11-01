@@ -84,12 +84,17 @@ function forwardedRequestHeaders(source, ip, host, client) {
   out["x-toprelay-client"] = client;
   return out;
 }
+var SAFE_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/;
 function filterResponseHeaders(source) {
   const out = new Headers();
   if (!source || typeof source !== "object") return out;
   for (const [name, value] of Object.entries(source)) {
     const lower = name.toLowerCase();
-    if (RESPONSE_HEADERS.has(lower) && typeof value === "string" && !/[\r\n]/.test(value)) out.set(lower, value);
+    if (!RESPONSE_HEADERS.has(lower) || typeof value !== "string" || !SAFE_VALUE.test(value)) continue;
+    try {
+      out.set(lower, value);
+    } catch {
+    }
   }
   return out;
 }
@@ -5594,11 +5599,11 @@ var PAIR_ERRORS = {
   no_code: "There's no active pairing code. Run toprelay pair on your computer, then try again.",
   too_many_attempts: "Too many attempts. Wait a few minutes, then try again."
 };
-async function checkPairCode(env, service, code) {
+async function checkPairCode(env, service, code, ip) {
   const stub = env.RELAY.get(env.RELAY.idFromName(service.name));
   const res = await stub.fetch("https://relay/pair-verify", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", [INTERNAL.ip]: ip },
     body: JSON.stringify({ code })
   });
   return res.json();
@@ -5622,24 +5627,24 @@ async function authorize(request, env, config, setup) {
         const denied = await oauth.denyConsent(request, handle);
         return new Response(null, { status: 302, headers: denied.headers });
       }
-      const service = config.services.get(String(form.get("service") ?? ""));
-      if (!service) return page("Unknown service", "<h1>Unknown service</h1>", 400);
-      const check = await checkPairCode(env, service, String(form.get("code") ?? ""));
-      if (!check.ok) {
-        const message = PAIR_ERRORS[check.reason ?? ""] ?? "The pairing code couldn't be checked.";
-        return page("Pairing code", `<h1>Not yet</h1><p class="warn" role="alert">${escape(message)}</p><p>Go back and try again.</p>`, 403);
-      }
       const approved = await oauth.approveConsent(request, handle, { scope: ["mcp", "offline_access"] });
-      if (serviceFromResource(config, approved.request.resource)?.name !== service.name) {
+      const service = serviceFromResource(config, approved.request.resource);
+      if (!service || service.name !== String(form.get("service") ?? "")) {
         return page("Can't authorize", "<h1>Can't authorize</h1><p>The request doesn't match this service. Start connecting again.</p>", 400);
       }
-      const requested = new Set(approved.request.scope);
-      const scope = ["mcp", ...requested.has("offline_access") ? ["offline_access"] : []];
+      const check = await checkPairCode(env, service, String(form.get("code") ?? ""), request.headers.get("cf-connecting-ip") ?? "");
+      if (!check.ok) {
+        const message = PAIR_ERRORS[check.reason ?? ""] ?? "The pairing code couldn't be checked.";
+        const details = await oauth.describeConsent(approved.request);
+        const again = await oauth.beginConsent(approved.request);
+        for (const [name, value] of approved.headers) if (name.toLowerCase() === "set-cookie") again.headers.append(name, value);
+        return page(`Allow ${details.clientName}?`, consentBody(service, details, again.handle, message), 403, again.headers);
+      }
       const { redirectTo } = await oauth.completeAuthorization({
         request: approved.request,
         userId: `svc-${service.name}`,
         metadata: { service: service.name },
-        scope,
+        scope: approved.request.scope,
         props: { service: service.name }
       });
       approved.headers.set("location", redirectTo);
@@ -5681,6 +5686,7 @@ var GcraLimiter = class {
 };
 var REQUEST_LIMIT = { interval: 50, burst: 60 };
 var PAIR_LIMIT = { interval: 12e4, burst: 5 };
+var PAIR_GLOBAL_LIMIT = { interval: 2e4, burst: 30 };
 
 // src/mcp.ts
 function offlineText(service) {
@@ -5717,12 +5723,14 @@ var START_TIMEOUT_MS = 12e4;
 var STREAM_IDLE_MS = 3e5;
 var TOTAL_TIMEOUT_MS = 84e4;
 var MAX_REVOKED = 1e4;
-var FLUSH_DELAY_MS = 6e4;
+var FLUSH_DELAY_MS = 5e3;
+var STREAM_BUFFER_LIMIT = 8 * 1024 * 1024;
 var json2 = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
 var stopTimer = (timer) => {
   if (timer !== void 0) clearTimeout(timer);
 };
 var today = (now) => new Date(now).toISOString().slice(0, 10);
+var emptyUsage = (day) => ({ day, requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 });
 function b64ToBytes(text2) {
   const bin = atob(text2);
   const out = new Uint8Array(bin.length);
@@ -5769,14 +5777,17 @@ var Relay = class extends DurableObject {
   pending = /* @__PURE__ */ new Map();
   requestLimiter = new GcraLimiter(REQUEST_LIMIT);
   pairLimiter = new GcraLimiter(PAIR_LIMIT);
+  pairGlobalLimiter = new GcraLimiter(PAIR_GLOBAL_LIMIT);
   revoked;
-  usage;
+  /** Counts since the last flush. Added to the stored row on flush, so a restart or hibernation loses at most
+   * the few seconds before FLUSH_DELAY_MS, and never overwrites newer stored numbers with older ones. */
+  delta;
   flushScheduled = false;
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
     this.revoked = new Set(this.getJson("revoked") ?? []);
-    this.usage = this.getJson("usage") ?? { day: today(Date.now()), requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 };
+    this.delta = emptyUsage(today(Date.now()));
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
   // ── storage ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -5794,15 +5805,44 @@ var Relay = class extends DurableObject {
   count(field, amount = 1) {
     const now = Date.now();
     const day = today(now);
-    if (this.usage.day !== day) this.usage = { day, requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 };
-    this.usage[field] += amount;
+    if (this.delta.day !== day) {
+      this.flushUsage();
+      this.delta = emptyUsage(day);
+    }
+    this.delta[field] += amount;
     if (!this.flushScheduled) {
       this.flushScheduled = true;
       this.ctx.storage.setAlarm(now + FLUSH_DELAY_MS);
     }
   }
+  /** Today's totals: what's stored plus what hasn't been flushed yet. */
+  usageToday(now) {
+    const day = today(now);
+    const stored = this.getJson("usage");
+    const base = stored && stored.day === day ? stored : emptyUsage(day);
+    if (this.delta.day !== day) return base;
+    return {
+      day,
+      requests: base.requests + this.delta.requests,
+      rejected: base.rejected + this.delta.rejected,
+      bytesIn: base.bytesIn + this.delta.bytesIn,
+      bytesOut: base.bytesOut + this.delta.bytesOut
+    };
+  }
   flushUsage() {
-    this.putJson("usage", this.usage);
+    const d = this.delta;
+    if (d.requests || d.rejected || d.bytesIn || d.bytesOut) {
+      const stored = this.getJson("usage");
+      const base = stored && stored.day === d.day ? stored : emptyUsage(d.day);
+      this.putJson("usage", {
+        day: d.day,
+        requests: base.requests + d.requests,
+        rejected: base.rejected + d.rejected,
+        bytesIn: base.bytesIn + d.bytesIn,
+        bytesOut: base.bytesOut + d.bytesOut
+      });
+    }
+    this.delta = emptyUsage(d.day);
     this.flushScheduled = false;
   }
   async alarm() {
@@ -5913,9 +5953,12 @@ var Relay = class extends DurableObject {
     const headers = filterResponseHeaders(frame.headers);
     p.started = true;
     stopTimer(p.startTimer);
-    p.body = new Uint8Array(0);
     if (frame.stream === true) {
-      const { readable, writable } = new TransformStream();
+      const { readable, writable } = new TransformStream(
+        {},
+        new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 }),
+        new ByteLengthQueuingStrategy({ highWaterMark: STREAM_BUFFER_LIMIT })
+      );
       p.writer = writable.getWriter();
       p.writer.closed.catch(() => this.cancel(id, true));
       this.resetIdle(id, p);
@@ -5948,6 +5991,7 @@ var Relay = class extends DurableObject {
     this.count("bytesOut", bytes.byteLength);
     this.resetIdle(frame.id, p);
     p.writer.write(bytes).catch(() => this.cancel(frame.id, true));
+    if ((p.writer.desiredSize ?? 0) < -STREAM_BUFFER_LIMIT) this.cancel(frame.id, false);
   }
   onEnd(ws, frame) {
     const p = this.pendingFor(ws, frame);
@@ -5978,9 +6022,7 @@ var Relay = class extends DurableObject {
     } catch {
     }
     if (!p.started) p.resolve(new Response("the service took too long to answer", { status: botGone ? 499 : 504 }));
-    else if (botGone) p.writer?.abort(new Error("cancelled")).catch(() => {
-    });
-    else p.writer?.close().catch(() => {
+    else p.writer?.abort(new Error(botGone ? "cancelled" : "stream stopped by the relay")).catch(() => {
     });
   }
   settle(id, p) {
@@ -6002,9 +6044,8 @@ var Relay = class extends DurableObject {
   offlineAnswer(p) {
     const text2 = offlineText(p.service);
     if (p.kind !== "mcp") return new Response(text2, { status: 503, headers: { "content-type": "text/plain; charset=utf-8", "retry-after": "30" } });
-    const rpc = parseRpc(p.body, p.contentType);
-    const method = p.mcpMethod ?? rpc.method;
-    return method === "tools/call" ? toolError(rpc.id, text2) : rpcError(rpc.id, -32e3, text2, 503);
+    const method = p.mcpMethod ?? p.rpc.method;
+    return method === "tools/call" ? toolError(p.rpc.id, text2) : rpcError(p.rpc.id, -32e3, text2, 503);
   }
   // ── relaying a request ────────────────────────────────────────────────────────────────────────────────────────
   async relay(request) {
@@ -6035,6 +6076,7 @@ var Relay = class extends DurableObject {
     this.count("bytesIn", body.byteLength);
     const contentType = h.get("content-type");
     const mcpMethod = kind === "mcp" ? h.get("mcp-method") : null;
+    const rpc = kind === "mcp" ? parseRpc(body, contentType) : { id: null };
     const keyTools = h.get(INTERNAL.tools) ? JSON.parse(h.get(INTERNAL.tools)) : void 0;
     const agent = this.agentSocket();
     const toolName = mcpMethod === "tools/call" ? h.get("mcp-name") : null;
@@ -6044,12 +6086,12 @@ var Relay = class extends DurableObject {
       const allowedByKey = keyTools === void 0 || keyTools.includes(toolName);
       if (!allowedByAgent || !allowedByKey) {
         this.count("rejected");
-        return toolError(parseRpc(body, contentType).id, disallowedText(service, toolName));
+        return toolError(rpc.id, disallowedText(service, toolName));
       }
     }
     if (!agent?.attachment.hello) {
       this.count("rejected");
-      return this.offlineAnswer({ service, kind, body, contentType, mcpMethod });
+      return this.offlineAnswer({ service, kind, rpc, mcpMethod });
     }
     this.count("requests");
     const id = `${this.incarnation}-${++this.seq}`;
@@ -6069,8 +6111,7 @@ var Relay = class extends DurableObject {
         ws: agent.ws,
         service,
         kind,
-        body,
-        contentType,
+        rpc,
         mcpMethod,
         started: false,
         settled: false,
@@ -6091,8 +6132,7 @@ var Relay = class extends DurableObject {
   // ── admin ─────────────────────────────────────────────────────────────────────────────────────────────────────
   status(request) {
     const agent = this.agentSocket();
-    const day = today(Date.now());
-    const usage = this.usage.day === day ? this.usage : { day, requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 };
+    const usage = this.usageToday(Date.now());
     return json2({
       service: request.headers.get(INTERNAL.service) ?? "",
       connected: Boolean(agent?.attachment.hello),
@@ -6113,8 +6153,14 @@ var Relay = class extends DurableObject {
     return json2({ expires });
   }
   async verifyPairing(request) {
-    const limited = this.pairLimiter.take("pair", Date.now());
-    if (!limited.ok) return json2({ ok: false, reason: "too_many_attempts", retryAfter: Math.ceil(limited.retryAfterMs / 1e3) });
+    const now = Date.now();
+    const ip = request.headers.get(INTERNAL.ip) || "unknown";
+    const limited = this.pairLimiter.take(`ip:${ip}`, now);
+    const global = limited.ok ? this.pairGlobalLimiter.take("all", now) : limited;
+    if (!limited.ok || !global.ok) {
+      const retry = !limited.ok ? limited.retryAfterMs : global.ok ? 0 : global.retryAfterMs;
+      return json2({ ok: false, reason: "too_many_attempts", retryAfter: Math.ceil(retry / 1e3) });
+    }
     const body = await request.json().catch(() => null);
     const pairing = this.getJson("pairing");
     if (!pairing || pairing.expires <= Math.floor(Date.now() / 1e3)) return json2({ ok: false, reason: "no_code" });
@@ -6220,6 +6266,7 @@ var index_default = {
       const resource = setup.resources.get(segments[2] ?? "");
       return resource ? resource.fetch(request, env, ctx) : text("not found", 404);
     }
+    if (url.pathname.includes("//") || /%2f|%5c/i.test(url.pathname)) return text("bad path", 400);
     const service = config.services.get(segments[0] ?? "");
     if (!service) return text("not found", 404);
     const rest = segments.slice(1);

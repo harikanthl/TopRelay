@@ -355,7 +355,7 @@ func parseDuration(s string) (time.Duration, error) {
 }
 
 func (a *App) loadConfig() (*config.Config, error) {
-	c, err := config.Load(a.Dir)
+	c, err := config.LoadMigrated(a.Dir, a.Store)
 	if err != nil {
 		if errors.Is(err, config.ErrNotFound) {
 			return nil, errf("no_config", "run `toprelay login`, then `toprelay add <name> …`", "no TopRelay configuration in %s", a.Dir)

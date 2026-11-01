@@ -58,8 +58,8 @@ struct AddServiceView: View {
         Section {
             TextField("Name", text: $name, prompt: Text("notes"))
                 .onChange(of: name) { _, new in
-                    let cleaned = new.lowercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
-                    if cleaned != new { name = String(cleaned.prefix(32)) }
+                    let cleaned = String(new.lowercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }.prefix(32))
+                    if cleaned != new { name = cleaned }
                 }
             if let problem = nameProblem {
                 Text(problem).font(.caption).foregroundStyle(.orange)
@@ -133,7 +133,7 @@ struct AddServiceView: View {
         guard !name.isEmpty, nameProblem == nil else { return false }
         switch kind {
         case .mcpURL, .http: return URL(string: url)?.host != nil
-        case .stdio: return !Self.split(command).isEmpty
+        case .stdio: return !(Self.split(command) ?? []).isEmpty
         }
     }
 
@@ -143,7 +143,7 @@ struct AddServiceView: View {
         case .mcpURL: source = .mcpURL(url.trimmingCharacters(in: .whitespaces))
         case .stdio:
             let dir = cwd.trimmingCharacters(in: .whitespaces)
-            source = .stdio(command: Self.split(command), cwd: dir.isEmpty ? nil : (dir as NSString).expandingTildeInPath)
+            source = .stdio(command: Self.split(command) ?? [], cwd: dir.isEmpty ? nil : (dir as NSString).expandingTildeInPath)
         case .http:
             let list = paths.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             source = .http(url.trimmingCharacters(in: .whitespaces), paths: list)
@@ -151,6 +151,8 @@ struct AddServiceView: View {
         let service = name
         let header = header.trimmingCharacters(in: .whitespaces)
         let defaults = toolsDefault.rawValue
+        // Pin the selection so the success screen stays put when the list reloads with the new app.
+        model.destination = .add
         action.perform {
             let added = try await model.add(name: service, source: source, toolsDefault: defaults, header: header.isEmpty ? nil : header)
             addedName = service
@@ -158,27 +160,61 @@ struct AddServiceView: View {
         }
     }
 
-    /// Splits a command line like a shell would for simple cases: spaces separate words, quotes group them.
-    static func split(_ line: String) -> [String] {
+    /// Splits a command line the way a POSIX shell does for the common cases: spaces separate words, single quotes
+    /// keep everything literal, double quotes group words and honour \" and \\, a backslash escapes the next
+    /// character outside quotes, and a leading ~ in an unquoted word is the home folder. Returns nil when a quote is
+    /// left open or the line ends in a lone backslash.
+    static func split(_ line: String) -> [String]? {
         var words: [String] = []
         var current = ""
+        var inWord = false
         var quote: Character?
-        var hasWord = false
+        var escaped = false
+        var startsWithTilde = false
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+
+        func finish() {
+            guard inWord else { return }
+            if startsWithTilde, current == "~" || current.hasPrefix("~/") {
+                current = home + current.dropFirst()
+            }
+            words.append(current)
+            current = ""
+            inWord = false
+            startsWithTilde = false
+        }
+
         for ch in line {
-            if let q = quote {
-                if ch == q { quote = nil } else { current.append(ch) }
-            } else if ch == "\"" || ch == "'" {
-                quote = ch
-                hasWord = true
-            } else if ch == " " || ch == "\t" {
-                if hasWord || !current.isEmpty { words.append(current) }
-                current = ""
-                hasWord = false
-            } else {
+            if escaped {
                 current.append(ch)
+                escaped = false
+                continue
+            }
+            switch quote {
+            case "'":
+                if ch == "'" { quote = nil } else { current.append(ch) }
+            case "\"":
+                if ch == "\"" { quote = nil }
+                else if ch == "\\" { escaped = true }
+                else { current.append(ch) }
+            default:
+                if ch == "\\" {
+                    escaped = true
+                    inWord = true
+                } else if ch == "'" || ch == "\"" {
+                    quote = ch
+                    inWord = true
+                } else if ch == " " || ch == "\t" {
+                    finish()
+                } else {
+                    if !inWord { startsWithTilde = ch == "~" }
+                    current.append(ch)
+                    inWord = true
+                }
             }
         }
-        if hasWord || !current.isEmpty { words.append(current) }
+        if quote != nil || escaped { return nil }
+        finish()
         return words
     }
 

@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -71,6 +72,9 @@ func TestDocumentedVerifiers(t *testing.T) {
 		t.Run(v.name, func(t *testing.T) {
 			if _, err := exec.LookPath(v.tool); err != nil {
 				t.Skipf("%s not installed", v.tool)
+			}
+			if v.name == "swift" && runtime.GOOS != "darwin" {
+				t.Skip("the Swift verifier uses CryptoKit, which is Apple-only")
 			}
 			if v.setup != nil {
 				if err := v.setup(); err != nil {

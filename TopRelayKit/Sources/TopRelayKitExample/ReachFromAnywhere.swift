@@ -13,6 +13,9 @@ import TopRelayKit
 public final class ReachFromAnywhereModel: ObservableObject {
     @Published public private(set) var isOn = false
     @Published public private(set) var busy = false
+    /// The position the switch was just moved to, while that change is still being made (nil otherwise). The
+    /// switch shows it at once; if the change fails it goes back.
+    @Published public private(set) var pendingOn: Bool?
     @Published public private(set) var url: String?
     @Published public private(set) var connected = false
     @Published public private(set) var lastError: String?
@@ -52,7 +55,11 @@ public final class ReachFromAnywhereModel: ObservableObject {
 
     public func setOn(_ on: Bool) async {
         busy = true
-        defer { busy = false }
+        pendingOn = on
+        defer {
+            busy = false
+            pendingOn = nil
+        }
         do {
             if on {
                 let exists = try await relay.services().contains { $0.name == service }
@@ -122,47 +129,116 @@ public final class ReachFromAnywhereModel: ObservableObject {
 
 public struct ReachFromAnywhereToggle: View {
     @ObservedObject var model: ReachFromAnywhereModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var copied = false
+    @State private var copiedReset: Task<Void, Never>?
 
     public init(model: ReachFromAnywhereModel) {
         self.model = model
     }
 
+    /// Shown and hidden content fades; it rises a few points unless the user asked for less motion.
+    private var reveal: AnyTransition {
+        reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 4))
+    }
+
+    private var shownOn: Bool { model.pendingOn ?? model.isOn }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle("Reach from anywhere", isOn: Binding(get: { model.isOn }, set: { on in Task { await model.setOn(on) } }))
-                .disabled(model.busy)
-            Text("Lets claude.ai, ChatGPT and other bots you approve use this app's tools, through a relay on your own Cloudflare account.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            if model.isOn, let url = model.url {
-                HStack {
-                    Circle().fill(model.connected ? Color.green : Color.orange).frame(width: 8, height: 8)
-                    Text(model.connected ? "Connected" : (model.lastError ?? "Connecting…"))
-                        .font(.caption)
-                    Spacer()
-                    Text("\(model.requests) calls").font(.caption).foregroundStyle(.secondary)
-                }
-                HStack {
-                    Text(url).font(.system(.caption, design: .monospaced)).textSelection(.enabled).lineLimit(1)
-                    Button("Copy") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(url, forType: .string)
-                    }
-                }
-                HStack {
-                    Button("Pairing code for claude.ai…") { Task { await model.makePairingCode() } }
-                    if let p = model.pairing {
-                        Text(p.code).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                        Text("valid until \(p.expiresAt.formatted(date: .omitted, time: .shortened))").font(.caption)
-                    }
+            HStack(spacing: 8) {
+                Toggle("Reach from anywhere", isOn: Binding(get: { shownOn }, set: { on in Task { await model.setOn(on) } }))
+                    .disabled(model.busy)
+                if model.busy {
+                    ProgressView().controlSize(.small)
+                        .transition(.opacity)
                 }
             }
+            Group {
+                if model.pendingOn == true {
+                    Text("Setting up the relay… the first time can take a minute.")
+                } else if model.pendingOn == false {
+                    Text("Turning off…")
+                } else {
+                    Text("Lets claude.ai, ChatGPT and other bots you approve use this app's tools, through a relay on your own Cloudflare account.")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            if model.isOn, let url = model.url {
+                VStack(alignment: .leading, spacing: 8) {
+                    status
+                    HStack {
+                        Text(url)
+                            .font(.system(.caption, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .help(url)
+                        Button { copy(url) } label: {
+                            Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                                .contentTransition(.opacity)
+                        }
+                        .accessibilityLabel(copied ? "Copied the address" : "Copy the address")
+                    }
+                    HStack(spacing: 8) {
+                        Button("Get pairing code") { Task { await model.makePairingCode() } }
+                        if let p = model.pairing {
+                            Text(p.code)
+                                .font(.system(.body, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text("for claude.ai, valid until \(p.expiresAt.formatted(date: .omitted, time: .shortened))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.2), value: model.pairing?.code)
+                }
+                .transition(reveal)
+            }
         }
+        .animation(.easeOut(duration: 0.2), value: model.isOn && model.url != nil)
+        .animation(.easeOut(duration: 0.15), value: model.busy)
         .task { await model.load() }
         .alert(model.failure?.message ?? "", isPresented: Binding(get: { model.failure != nil }, set: { if !$0 { model.failure = nil } })) {
             Button("OK") { model.failure = nil }
         } message: {
             Text(model.failure?.fix ?? "")
+        }
+    }
+
+    private var status: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Circle()
+                .fill(model.connected ? Color.green : Color.orange)
+                .frame(width: 8, height: 8)
+                .accessibilityHidden(true) // the text says it
+            Text(model.connected ? "Connected" : (model.lastError ?? "Connecting…"))
+                .font(.caption)
+                .lineLimit(2)
+                .help(model.lastError ?? "")
+            Spacer()
+            Text("\(model.requests) calls")
+                .font(.caption)
+                .monospacedDigit()
+                .contentTransition(.numericText())
+                .foregroundStyle(.secondary)
+        }
+        .animation(.easeOut(duration: 0.15), value: model.connected)
+        .animation(.easeOut(duration: 0.15), value: model.requests)
+    }
+
+    private func copy(_ url: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+        withAnimation(.easeOut(duration: 0.15)) { copied = true }
+        copiedReset?.cancel()
+        copiedReset = Task {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) { copied = false }
         }
     }
 }

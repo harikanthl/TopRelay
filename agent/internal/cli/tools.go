@@ -12,6 +12,7 @@ import (
 	"github.com/harikanthl/toprelay/agent/internal/names"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
 	"github.com/harikanthl/toprelay/agent/internal/stdiobridge"
+	"github.com/harikanthl/toprelay/agent/internal/upstream"
 )
 
 // ToolView is one tool as shown by `add` and `tools`.
@@ -32,7 +33,7 @@ func readOnly(t *mcp.Tool) bool { return t.Annotations != nil && t.Annotations.R
 func toolViews(service string, tools []*mcp.Tool, p config.ToolPolicy) []ToolView {
 	out := make([]ToolView, 0, len(tools))
 	for _, t := range tools {
-		v := ToolView{Name: t.Name, Title: t.Title, Description: t.Description, Allowed: p.Allowed(t.Name),
+		v := ToolView{Name: t.Name, Title: t.Title, Description: t.Description, Allowed: p.Base(t.Name, hintOf(t)),
 			ReadOnly: readOnly(t), Destructive: !readOnly(t), OpenWorld: true, Warnings: names.ToolWarnings(service, t.Name)}
 		if an := t.Annotations; an != nil {
 			if an.Title != "" && v.Title == "" {
@@ -56,16 +57,12 @@ func toolViews(service string, tools []*mcp.Tool, p config.ToolPolicy) []ToolVie
 
 // listLocalTools connects to the service's local MCP server and lists its tools. env is the stdio child's
 // environment (values from the keyring, or from --env during add).
-func (a *App) listLocalTools(s *config.Service, headerValue string, env map[string]string) ([]*mcp.Tool, error) {
+func (a *App) listLocalTools(s *config.Service, up *upstream.Upstream, env map[string]string) ([]*mcp.Tool, error) {
 	ctx, cancel := context.WithTimeout(a.Ctx, 30*time.Second)
 	defer cancel()
 	switch s.Source.Type {
 	case config.SourceMCPURL:
-		var h map[string]string
-		if s.UpstreamHeader != "" {
-			h = map[string]string{s.UpstreamHeader: headerValue}
-		}
-		tools, err := mcpproxy.ListTools(ctx, s.Source.URL, h)
+		tools, err := mcpproxy.ListTools(ctx, up.Endpoint.URL.String(), up.Client())
 		if err != nil {
 			return nil, errf("local_unreachable", "start the app that serves "+s.Source.URL+", then try again", "%v", err)
 		}
@@ -89,27 +86,16 @@ func (a *App) stdioEnv(s *config.Service) (map[string]string, error) {
 	return env, nil
 }
 
-func (a *App) upstreamValue(s *config.Service) (string, error) {
-	if s.UpstreamHeader == "" {
-		return "", nil
-	}
-	v, err := secrets.Require(a.Store, secrets.UpstreamHeader(s.Name), "remove and re-add the service with --header")
-	if err != nil {
-		return "", wrap("keyring", "remove and re-add the service with --header", err)
-	}
-	return v, nil
+// hintOf reads a tool's annotations as the policy sees them.
+func hintOf(t *mcp.Tool) config.Hint {
+	h := mcpproxy.HintsFromTools([]*mcp.Tool{t})[0]
+	return config.Hint{Known: true, ReadOnly: h.ReadOnly, Destructive: h.Destructive}
 }
 
-// defaultPolicy allows the read-only tools and denies the rest; default for new tools: deny.
+// defaultPolicy honours MCP annotations: read-only tools are exposed, now and when the server adds more;
+// everything else waits for an explicit allow.
 func defaultPolicy(tools []*mcp.Tool) config.ToolPolicy {
-	p := config.ToolPolicy{Default: config.DefaultDeny}
-	for _, t := range tools {
-		if readOnly(t) {
-			p.SetAllowed(t.Name)
-		} else {
-			p.SetDenied(t.Name)
-		}
-	}
+	p := config.ToolPolicy{Default: config.DefaultReadOnly}
 	p.Normalize()
 	return p
 }

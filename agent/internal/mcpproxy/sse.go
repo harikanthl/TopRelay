@@ -13,6 +13,12 @@ import (
 // tools/list id. Other events pass through byte for byte. It flushes after every event. onSeen receives the tool
 // names seen in each filtered result.
 func FilterSSE(w io.Writer, r io.Reader, listIDs map[string]bool, allowed Allowed, onSeen func([]string)) error {
+	return TransformSSE(w, r, ListTransform(listIDs, allowed), onSeen)
+}
+
+// TransformSSE copies an SSE stream event by event, applying t to each event's data. Unchanged events pass
+// through byte for byte.
+func TransformSSE(w io.Writer, r io.Reader, t Transform, onSeen func([]string)) error {
 	br := bufio.NewReaderSize(r, 64<<10)
 	fl, _ := w.(http.Flusher)
 	var event [][]byte
@@ -20,7 +26,7 @@ func FilterSSE(w io.Writer, r io.Reader, listIDs map[string]bool, allowed Allowe
 		if len(event) == 0 {
 			return nil
 		}
-		out := rewriteEvent(event, listIDs, allowed, onSeen)
+		out := rewriteEvent(event, t, onSeen)
 		event = event[:0]
 		if _, err := w.Write(out); err != nil {
 			return err
@@ -52,9 +58,9 @@ func FilterSSE(w io.Writer, r io.Reader, listIDs map[string]bool, allowed Allowe
 	}
 }
 
-func rewriteEvent(lines [][]byte, listIDs map[string]bool, allowed Allowed, onSeen func([]string)) []byte {
+func rewriteEvent(lines [][]byte, t Transform, onSeen func([]string)) []byte {
 	raw := bytes.Join(lines, nil)
-	if len(listIDs) == 0 {
+	if t == nil {
 		return raw
 	}
 	var data []string
@@ -70,12 +76,12 @@ func rewriteEvent(lines [][]byte, listIDs map[string]bool, allowed Allowed, onSe
 		return raw
 	}
 	payload := []byte(strings.Join(data, "\n"))
-	out, changed, seen := FilterMessage(payload, listIDs, allowed)
+	out, changed, seen := t(payload)
+	if onSeen != nil && len(seen) > 0 {
+		onSeen(seen)
+	}
 	if !changed {
 		return raw
-	}
-	if onSeen != nil {
-		onSeen(seen)
 	}
 	var b bytes.Buffer
 	wroteData := false

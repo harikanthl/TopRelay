@@ -254,8 +254,9 @@ This is the user's Cloudflare credential for deploying, not the OAuth that bots 
   Cloudflare on the user's own account. The relay logs nothing and stores only OAuth grants. Say this plainly in
   the README.
 - Remote-client auth on every service (see Credentials); rejected before any Durable Object call.
-- Apps should treat relayed calls as remote: TopRelay sets `cf-connecting-ip` / `x-forwarded-for` so the app can
-  apply its remote rules (ezRecord: remote token, no deletes, library-only paths).
+- Apps should treat relayed calls as remote: TopRelay sets `cf-connecting-ip` / `x-forwarded-for`, and signs every
+  relayed request with `X-TopRelay-Caller` (HMAC, per-service key) so the app can trust it and apply its remote
+  rules (ezRecord: remote token, no deletes, library-only paths). See `MIGRATION.md`.
 - Tool allow-list in the agent; path allow-list for raw HTTP services.
 - Body cap, per-request timeout, per-service rate limit, header allow-list.
 - Don't add `Origin` handling that lets browsers drive local apps through the relay.

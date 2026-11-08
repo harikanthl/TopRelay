@@ -35,6 +35,8 @@ export const INTERNAL = {
   tools: "x-toprelay-tools",
   ip: "x-toprelay-ip",
   host: "x-toprelay-host",
+  fileId: "x-toprelay-file-id",
+  fileExp: "x-toprelay-file-exp",
 } as const;
 
 export function forwardedRequestHeaders(source: Headers, ip: string, host: string, client: string): Record<string, string> {

@@ -5,7 +5,7 @@ import type { OAuthResourceContext } from "@cloudflare/workers-oauth-provider";
 import type { Config, Env, Service } from "./config";
 import { loadConfig } from "./config";
 import { INTERNAL, REQUEST_HEADERS } from "./headers";
-import { checkAgentKey } from "./keys";
+import { checkAgentKey, verifyFileUrl } from "./keys";
 import type { RelayProps } from "./oauth";
 import { authorize, oauthFor, revokeServiceGrants } from "./oauth";
 
@@ -84,6 +84,23 @@ async function agentRoute(request: Request, env: Env, config: Config, service: S
   return text("not found", 404);
 }
 
+/** A signed, single-use download link (docs/protocol.md "Files"). The signature is the credential, so bots can
+ * fetch it without OAuth; it's checked here, before any Durable Object call. */
+async function fileRoute(request: Request, env: Env, service: Service, id: string): Promise<Response> {
+  if (request.method !== "GET") return text("method not allowed", 405);
+  const url = new URL(request.url);
+  const v = await verifyFileUrl(env.BEARER_ROOT, service.name, service.gen, id, url.searchParams.get("e"), url.searchParams.get("s"), Math.floor(Date.now() / 1000));
+  if (!v.ok) return text(v.reason, v.status);
+  const headers = new Headers({
+    [INTERNAL.service]: service.name,
+    [INTERNAL.fileId]: id,
+    [INTERNAL.fileExp]: String(v.exp),
+    [INTERNAL.ip]: request.headers.get("cf-connecting-ip") ?? "",
+    [INTERNAL.host]: url.host,
+  });
+  return relayStub(env, service).fetch("https://relay/file", { method: "POST", headers, signal: request.signal });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -117,6 +134,8 @@ export default {
     if (!service) return text("not found", 404);
     const rest = segments.slice(1);
     if (rest[0] === "connect" || rest[0] === "admin") return agentRoute(request, env, config, service, rest);
+    // Only mcp services: under an http service every path is the app's.
+    if (service.kind === "mcp" && rest[0] === "files" && rest.length === 2) return fileRoute(request, env, service, rest[1]);
 
     if (service.kind === "mcp" && rest[0] !== "mcp") return text("not found", 404);
     return setup.resources.get(service.name)!.fetch(request, env, ctx);

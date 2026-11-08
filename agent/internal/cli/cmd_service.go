@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	iofs "io/fs"
 	"log/slog"
 	"math/big"
 	"os"
@@ -15,12 +17,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/harikanthl/toprelay/agent/internal/caller"
 	"github.com/harikanthl/toprelay/agent/internal/calllog"
 	"github.com/harikanthl/toprelay/agent/internal/config"
 	"github.com/harikanthl/toprelay/agent/internal/daemon"
+	"github.com/harikanthl/toprelay/agent/internal/files"
 	"github.com/harikanthl/toprelay/agent/internal/keys"
 	"github.com/harikanthl/toprelay/agent/internal/relayapi"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
+	"github.com/harikanthl/toprelay/agent/internal/service"
 )
 
 // FreeRequestsPerDay is the Workers Free request allowance.
@@ -62,7 +67,8 @@ func cmdUp(a *App, args []string) error {
 	fs := a.newFlags("up", "up [--install | --uninstall] [--verbose]", `
 Keep every service connected to the relay: one tunnel per service, reconnecting after sleep, network changes and
 redeploys. Edits from `+"`toprelay add/tools/rotate/remove`"+` are picked up live (or send SIGHUP).
-Live status for other programs is written to <config dir>/state.json.
+Live status for other programs is written to <config dir>/state.json, and apps can drive TopRelay through the
+control socket <config dir>/agent.sock (TopRelayKit; see the README). Only one `+"`up`"+` runs per config dir.
 
   --install    run `+"`toprelay up`"+` at login: a launchd agent on macOS (~/Library/LaunchAgents/dev.toprelay.agent.plist),
                a systemd user unit on Linux; logs go to <config dir>/logs/agent.log
@@ -110,7 +116,17 @@ Live status for other programs is written to <config dir>/state.json.
 	if *verbose {
 		level = slog.LevelDebug
 	}
-	log := slog.New(slog.NewTextHandler(a.Stderr, &slog.HandlerOptions{Level: level}))
+	logOut := a.Stderr
+	if a.JSON {
+		// An app that runs `up --json` as a child gets nothing on stderr to drain; the log goes to a file.
+		lf, err := openAgentLog(a.Dir)
+		if err != nil {
+			return wrap("log", "check permissions on "+a.Dir, err)
+		}
+		defer lf.Close()
+		logOut = lf
+	}
+	log := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: level}))
 	ctx, stop := signal.NotifyContext(a.Ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	hup := make(chan os.Signal, 1)
@@ -130,12 +146,33 @@ Live status for other programs is written to <config dir>/state.json.
 			}
 		}
 	}()
-	d := &daemon.Daemon{Dir: a.Dir, Store: a.Store, RelayURL: a.RelayURL, Log: log, Reload: reload}
-	log.Info("toprelay up", "version", Version, "services", len(cfg.Services), "state", daemon.StatePath(a.Dir))
+	state := daemon.NewStateFile(daemon.StatePath(a.Dir), nil)
+	reg := files.NewRegistry()
+	d := &daemon.Daemon{Dir: a.Dir, Store: a.Store, RelayURL: a.RelayURL, Log: log, Reload: reload, State: state, Files: reg}
+	l, err := listenControl(a.Dir)
+	switch {
+	case errors.Is(err, ErrAgentRunning):
+		return errf("already_running", "stop the other one first (`toprelay up --uninstall` if it was installed), or use it", "%v", err)
+	case err != nil:
+		log.Warn("no control socket (TopRelayKit can't connect); everything else works", "path", ControlPath(a.Dir), "err", err)
+	default:
+		defer os.Remove(ControlPath(a.Dir))
+		defer l.Close()
+		go (&control{a: a, state: state, files: reg, log: log}).serve(ctx, l)
+	}
+	log.Info("toprelay up", "version", Version, "services", len(cfg.Services), "state", daemon.StatePath(a.Dir), "control", ControlPath(a.Dir))
 	if err := d.Run(ctx); err != nil {
 		return wrap("up", "run `toprelay doctor`", err)
 	}
 	return nil
+}
+
+// openAgentLog opens <dir>/logs/agent.log for appending (0600), the same file `up --install` logs to.
+func openAgentLog(dir string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0o700); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(filepath.Join(dir, "logs", "agent.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 }
 
 // StatusService is one service in status --json.
@@ -166,11 +203,20 @@ type StatusResult struct {
 }
 
 func cmdStatus(a *App, args []string) error {
-	fs := a.newFlags("status", "status", `
+	fs := a.newFlags("status", "status [--watch]", `
 For each service: whether the relay has this computer's connection, and today's requests, rejected requests and
-bytes, against the Workers Free allowance of 100,000 requests a day (counted per account, all services together).`)
+bytes, against the Workers Free allowance of 100,000 requests a day (counted per account, all services together).
+
+--watch follows the local agent instead (no relay calls): it prints the current state.json at once, then again
+every time it changes, until interrupted. With --json each one is a single line: {"version","pid","startedAt",
+"updatedAt","running","services":{name:{"connected","since","lastError","reconnectAttempt","nextRetryMs",
+"requests","refused"}}}. "running" is false when no `+"`toprelay up`"+` is running (also after a crash).`)
+	watch := fs.Bool("watch", false, "print the local state on every change (one JSON line each with --json)")
 	if _, _, err := parse(fs, args); err != nil {
 		return err
+	}
+	if *watch {
+		return a.watchStatus(250 * time.Millisecond)
 	}
 	cfg, err := a.loadConfig()
 	if err != nil {
@@ -225,6 +271,9 @@ bytes, against the Workers Free allowance of 100,000 requests a day (counted per
 				continue
 			}
 			a.say("%-12s %-9s  today: %d requests, %d rejected, %s in, %s out\n", s.Name, conn, s.Requests, s.Rejected, bytesHuman(s.BytesIn), bytesHuman(s.BytesOut))
+			if s.Local != nil && (s.Local.Refused > 0 || s.Local.Limited > 0) {
+				a.say("             this session: %d calls, %d refused by the tool policy, %d over your rate limits\n", s.Local.Requests, s.Local.Refused, s.Local.Limited)
+			}
 			if !s.Connected {
 				a.say("             fix: run `toprelay up` on the computer with this service\n")
 			}
@@ -234,6 +283,64 @@ bytes, against the Workers Free allowance of 100,000 requests a day (counted per
 			a.say("warning: close to the Workers Free daily limit; requests fail once it's reached until 00:00 UTC\n")
 		}
 	})
+}
+
+// watchStatus prints state.json whenever its content changes (updatedAt alone doesn't count), and once at start.
+func (a *App) watchStatus(poll time.Duration) error {
+	ctx, stop := signal.NotifyContext(a.Ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	path := daemon.StatePath(a.Dir)
+	last := ""
+	for {
+		st, err := daemon.ReadState(path)
+		if err != nil {
+			st = &daemon.State{Version: daemon.StateVersion, Services: map[string]*daemon.ServiceState{}}
+		}
+		key := *st
+		key.UpdatedAt = time.Time{}
+		kb, _ := json.Marshal(key)
+		if string(kb) != last {
+			last = string(kb)
+			if a.JSON {
+				b, _ := json.Marshal(st)
+				fmt.Fprintf(a.Stdout, "%s\n", b)
+			} else {
+				a.printWatch(st)
+			}
+		}
+		t := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil // an interrupt or --timeout ends a watch normally
+		case <-t.C:
+		}
+	}
+}
+
+func (a *App) printWatch(st *daemon.State) {
+	now := a.Now().Format("15:04:05")
+	if !st.Running {
+		fmt.Fprintf(a.Stdout, "%s  toprelay up is not running\n", now)
+		return
+	}
+	names := make([]string, 0, len(st.Services))
+	for n := range st.Services {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	for _, n := range names {
+		s := st.Services[n]
+		conn := "offline"
+		if s.Connected {
+			conn = "connected"
+		}
+		line := fmt.Sprintf("%s  %-12s %-9s %d requests, %d refused", now, n, conn, s.Requests, s.Refused)
+		if s.LastError != "" && !s.Connected {
+			line += "  (" + s.LastError + ")"
+		}
+		fmt.Fprintln(a.Stdout, line)
+	}
 }
 
 func bytesHuman(n int64) string {
@@ -262,6 +369,12 @@ type ListService struct {
 	NewTools       string   `json:"newTools"`
 	AllowPaths     []string `json:"allowPaths,omitempty"`
 	UpstreamHeader string   `json:"upstreamHeader,omitempty"`
+	// UpstreamHeaderSource is "keyring" or "file" when UpstreamHeader is set.
+	UpstreamHeaderSource string      `json:"upstreamHeaderSource,omitempty"`
+	UpstreamHeaderFile   string      `json:"upstreamHeaderFile,omitempty"`
+	CallerKeyFile        string      `json:"callerKeyFile,omitempty"`
+	Pin                  *config.Pin `json:"pin,omitempty"`
+	FilesDir             string      `json:"filesDir,omitempty"`
 }
 
 func cmdList(a *App, args []string) error {
@@ -282,31 +395,75 @@ func cmdList(a *App, args []string) error {
 		s := &cfg.Services[i]
 		out.Services = append(out.Services, ListService{Name: s.Name, Kind: s.Kind, Source: s.Source.Type, Local: s.LocalTarget(),
 			URL: serviceURL(cfg, s), SSEURL: sseURL(cfg, s), Gen: s.Gen, AllowedTools: s.Tools.Allow, DeniedTools: s.Tools.Deny,
-			NewTools: s.Tools.Default, AllowPaths: s.AllowPaths, UpstreamHeader: s.UpstreamHeader})
+			NewTools: s.Tools.Default, AllowPaths: s.AllowPaths, UpstreamHeader: s.UpstreamHeader, UpstreamHeaderFile: s.UpstreamHeaderFile,
+			Pin: s.Pin, FilesDir: s.FilesDir})
+		ls := &out.Services[len(out.Services)-1]
+		if s.UpstreamHeader != "" {
+			ls.UpstreamHeaderSource = "keyring"
+			if s.UpstreamHeaderFile != "" {
+				ls.UpstreamHeaderSource = "file"
+			}
+		}
+		if s.HasUpstream() {
+			ls.CallerKeyFile = service.CallerKeyPath(a.Dir, *s)
+		}
 	}
 	return a.emit(out, func() {
 		if len(out.Services) == 0 {
 			a.say("No services yet: toprelay add <name> …\n")
 			return
 		}
-		for _, s := range out.Services {
+		for i, s := range out.Services {
 			a.say("%-12s %-4s %s\n             → %s\n", s.Name, s.Kind, s.URL, s.Local)
+			if h := describeHeader(&cfg.Services[i]); h != "" {
+				a.say("             credential: %s\n", h)
+			}
+			if s.Pin != nil {
+				a.say("             pinned to: %s\n", service.Pin(cfg.Services[i]).String())
+			}
 		}
 	})
 }
 
 func cmdLogs(a *App, args []string) error {
-	fs := a.newFlags("logs", "logs <name> [-f] [-n N]", `
-Show the local call log of a service: time, method, path, MCP method, tool, status, duration and client.
-No bodies or credentials are ever logged. With --json, prints one JSON object per call per line.`)
+	fs := a.newFlags("logs", "logs <name> [-f] [-n N] | logs --retention DAYS", `
+Show the local call log of a service: time, method, path, MCP method, tool, status, duration, client, bytes in and
+out, and why a call was refused. No bodies or credentials are ever logged. With --json, prints one JSON object
+per call per line:
+  {"time","method","path","mcpMethod"?,"tool"?,"status","durationMs","client"?,"refused"?,"reason"?,"bytesIn","bytesOut"}
+reason is tool_not_allowed, invalid_request, rate_limited, credential_unavailable or app_unreachable.
+
+--retention DAYS keeps records for that many days, for every service (0: until the 10 MB size cap rotates them
+out); a running `+"`toprelay up`"+` applies it within the hour.`)
 	follow := fs.Bool("f", false, "keep printing new calls")
 	n := fs.Int("n", 20, "how many recent calls to show (0: all)")
+	svcFlag := fs.String("service", "", "the service (instead of the positional name)")
+	retention := fs.Int("retention", -1, "set how many days of call log to keep (0: no age limit)")
 	pos, _, err := parse(fs, args)
 	if err != nil {
 		return err
 	}
+	if *retention >= 0 {
+		if len(pos) > 0 || *svcFlag != "" || *follow {
+			return usageErr("--retention applies to every service; give it alone")
+		}
+		cfg, err := a.loadConfig()
+		if err != nil {
+			return err
+		}
+		cfg.LogRetentionDays = *retention
+		if err := config.Save(a.Dir, cfg); err != nil {
+			return wrap("config", "check permissions on "+a.Dir, err)
+		}
+		return a.emit(map[string]any{"logRetentionDays": *retention}, func() {
+			a.say("✓ call logs keep %d days (0: no age limit)\n", *retention)
+		})
+	}
+	if *svcFlag != "" {
+		pos = append(pos, *svcFlag)
+	}
 	if len(pos) != 1 {
-		return usageErr("logs needs a service name")
+		return usageErr("logs needs one service name")
 	}
 	if _, _, err := a.loadService(pos[0]); err != nil {
 		return err
@@ -329,8 +486,12 @@ No bodies or credentials are ever logged. With --json, prints one JSON object pe
 		if r.Tool != "" {
 			what += " " + r.Tool
 		}
-		if r.Refused {
-			what += " (refused)"
+		if r.Refused || r.Reason != "" {
+			what += " (" + map[bool]string{true: "refused", false: "failed"}[r.Refused]
+			if r.Reason != "" {
+				what += ": " + r.Reason
+			}
+			what += ")"
 		}
 		fmt.Fprintf(a.Stdout, "%s  %-6s %-14s %-32s %3d %6dms  %s\n", r.Time.Local().Format("2006-01-02 15:04:05"), r.Method, r.Path, what, r.Status, r.DurationMs, r.Client)
 	}
@@ -416,6 +577,7 @@ keyring. Its call log is kept in <config dir>/logs.`)
 	}
 	name := s.Name
 	envNames := slices.Clone(s.Source.EnvNames) // cfg.Remove below shifts the slice s points into
+	ownCallerKey := s.HasUpstream() && s.CallerKeyFile == ""
 	var warnings []string
 	revoked := 0
 	key, kerr := a.agentKey(s)
@@ -441,6 +603,11 @@ keyring. Its call log is kept in <config dir>/logs.`)
 	}
 	if err := secrets.DeleteEnv(a.Store, name, envNames); err != nil {
 		warnings = append(warnings, "couldn't delete the stdio environment secrets: "+err.Error())
+	}
+	if ownCallerKey {
+		if err := os.Remove(caller.DefaultKeyPath(a.Dir, name)); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+			warnings = append(warnings, "couldn't delete the caller key: "+err.Error())
+		}
 	}
 	return a.emit(map[string]any{"service": name, "removed": true, "oauthRevoked": revoked, "warnings": nonNil(warnings)}, func() {
 		a.say("✓ %s removed from the relay (%d OAuth grants revoked)\n", name, revoked)

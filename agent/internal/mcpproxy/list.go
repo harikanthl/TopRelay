@@ -32,7 +32,7 @@ func HTTPClientWithHeaders(base http.RoundTripper, headers map[string]string) *h
 
 // Connect opens an MCP client session to a Streamable HTTP endpoint.
 func Connect(ctx context.Context, endpoint string, client *http.Client) (*mcp.ClientSession, error) {
-	c := mcp.NewClient(&mcp.Implementation{Name: "toprelay", Version: "0.1.0"}, &mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}})
+	c := mcp.NewClient(&mcp.Implementation{Name: "toprelay", Version: "0.2.0"}, &mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}})
 	t := &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: client, DisableStandaloneSSE: true, MaxRetries: 1}
 	cs, err := c.Connect(ctx, t, nil)
 	if err != nil {
@@ -53,9 +53,9 @@ func ListAllTools(ctx context.Context, cs *mcp.ClientSession) ([]*mcp.Tool, erro
 	return out, nil
 }
 
-// ListTools connects to an MCP URL, lists its tools and disconnects. headers are added to every request.
-func ListTools(ctx context.Context, endpoint string, headers map[string]string) ([]*mcp.Tool, error) {
-	cs, err := Connect(ctx, endpoint, HTTPClientWithHeaders(nil, headers))
+// ListTools connects to an MCP URL with client, lists its tools and disconnects.
+func ListTools(ctx context.Context, endpoint string, client *http.Client) ([]*mcp.Tool, error) {
+	cs, err := Connect(ctx, endpoint, client)
 	if err != nil {
 		return nil, err
 	}
@@ -70,4 +70,23 @@ func ToolNames(tools []*mcp.Tool) []string {
 		out = append(out, t.Name)
 	}
 	return out
+}
+
+// HintsFromTools reads listed tools' annotations (MCP default: destructive unless read-only or said otherwise).
+func HintsFromTools(tools []*mcp.Tool) []ToolHint {
+	hs := make([]ToolHint, 0, len(tools))
+	for _, t := range tools {
+		h := ToolHint{Name: t.Name, Destructive: true}
+		if a := t.Annotations; a != nil {
+			h.ReadOnly = a.ReadOnlyHint
+			if a.DestructiveHint != nil {
+				h.Destructive = *a.DestructiveHint
+			}
+		}
+		if h.ReadOnly {
+			h.Destructive = false
+		}
+		hs = append(hs, h)
+	}
+	return hs
 }

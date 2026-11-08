@@ -23,6 +23,16 @@ The most serious bugs are ones that let someone:
 - reach a local app, path or port that was not added as a service
 - make the relay or agent log request bodies or secrets
 
+## What TopRelay gives apps
+
+- **`X-TopRelay-Caller`**: an HMAC the agent adds to every relayed request, over the method, path, query, client,
+  time and body, keyed per service (`toprelay caller-key`). It proves the request came through TopRelay; the
+  relay never forwards a copy from a bot, and the agent removes one if it arrives. Verifiers: `MIGRATION.md`.
+- **Credentials off the command line**: `--header-file` (read on every request) and `--header-stdin` (keyring).
+  `--header` still works for compatibility and warns.
+- **Port-squatting defenses**: Unix socket upstreams with owner, mode and peer-user checks; on macOS, an optional
+  code-signature pin for TCP upstreams. Limits are in `agent/README.md`.
+
 ## What TopRelay does not protect against
 
 These are design limits, documented in the README, not vulnerabilities:
@@ -32,6 +42,9 @@ These are design limits, documented in the README, not vulnerabilities:
 - **Bots you approve can do what you allowed.** A bot with a valid credential can call every tool you exposed to
   it.
 - **`stdio` servers run as you.** A local MCP server started by the agent has your user's permissions.
+- **Other programs running as you.** A process with your user's rights can read your keyring entries and files
+  (including the caller key) and can send requests to your apps directly. TopRelay's checks keep *other users* and
+  the network out; they don't sandbox your own account.
 
 ## Supported versions
 

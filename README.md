@@ -16,6 +16,9 @@ tools each bot can use.
   network.
 - **Auth built in.** Every service needs OAuth or a bearer key, even if the local app has no auth of its own.
 - **You choose the tools.** Hide tools from the list, and refuse calls to tools you didn't allow.
+- **Apps can tell.** Every relayed call carries a signed `X-TopRelay-Caller` header, so an app knows for sure that
+  a call is remote and which bot made it. Credentials come from a file or the keyring, never the command line, and
+  can be changed live. Unix sockets and macOS code-signature pins stop another program from answering for the app.
 
 ```
 Bot ──HTTPS + OAuth/bearer──▶ https://toprelay.<you>.workers.dev/<service>/mcp
@@ -38,7 +41,7 @@ request bodies and stores only OAuth grants. See [SECURITY.md](SECURITY.md).
 ```sh
 cd agent && go build -o toprelay ./cmd/toprelay
 ./toprelay login                                   # Cloudflare API token
-./toprelay add notes --mcp-url http://127.0.0.1:7879/mcp
+./toprelay add notes --mcp-url http://127.0.0.1:7879/mcp --header-file "X-Notes-Token=$HOME/.notes/token"
 ./toprelay add tools --stdio -- node ./server.js
 ./toprelay up                                      # keep everything connected (up --install for login start)
 ./toprelay pair notes                              # code for the claude.ai consent page
@@ -48,7 +51,7 @@ cd agent && go build -o toprelay ./cmd/toprelay
 ```
 
 Not tested yet against real claude.ai, ChatGPT, Grok, Gemini or Qwen accounts. The compatibility table in
-`docs/brief.md` is filled only from real tests.
+`docs/brief.md` is filled only from real tests, following [`docs/bot-testing.md`](docs/bot-testing.md).
 
 ## Layout
 
@@ -56,7 +59,10 @@ Not tested yet against real claude.ai, ChatGPT, Grok, Gemini or Qwen accounts. T
 |---|---|
 | `worker/` | Relay Worker and `Relay` Durable Object (TypeScript). See [worker/README.md](worker/README.md) |
 | `agent/` | The `toprelay` Go CLI and daemon. See [agent/README.md](agent/README.md) |
-| `docs/protocol.md` | The exact contract between the two: frames, keys, routes, limits, test vectors |
+| `TopRelayKit/` | Swift package for Mac apps: drive the agent over its control socket. See [TopRelayKit/README.md](TopRelayKit/README.md) |
+| `docs/protocol.md` | The exact contract between the two (frames, keys, routes, limits, test vectors), and what a local app receives |
+| `MIGRATION.md` | For app authors: credentials from a file, verifying `X-TopRelay-Caller`, sockets and pins |
+| `docs/verifiers/` | `X-TopRelay-Caller` verifiers in Go, Swift, Python and Node, tested against the protocol vector |
 | `docs/brief.md` | Product brief and build plan |
 | `docs/research/` | Research notes behind the design |
 | `spike/oauth/` | Throwaway OAuth test against claude.ai |

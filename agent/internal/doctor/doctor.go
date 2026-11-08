@@ -13,6 +13,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/harikanthl/toprelay/agent/internal/caller"
 	"github.com/harikanthl/toprelay/agent/internal/cfapi"
 	"github.com/harikanthl/toprelay/agent/internal/config"
 	"github.com/harikanthl/toprelay/agent/internal/deploy"
@@ -21,7 +22,9 @@ import (
 	"github.com/harikanthl/toprelay/agent/internal/redact"
 	"github.com/harikanthl/toprelay/agent/internal/relayapi"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
+	"github.com/harikanthl/toprelay/agent/internal/service"
 	"github.com/harikanthl/toprelay/agent/internal/stdiobridge"
+	"github.com/harikanthl/toprelay/agent/internal/upstream"
 )
 
 // Status of a check.
@@ -256,24 +259,7 @@ func (r *runner) localCheck(ctx context.Context, e Env, s config.Service) {
 	name := "local service: " + s.Name
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	headers := map[string]string{}
-	if s.UpstreamHeader != "" {
-		v, err := e.Store.Get(secrets.UpstreamHeader(s.Name))
-		if err != nil {
-			r.add(Check{Name: name, Status: Fail, Detail: "upstream header value missing from the keyring", Fix: "remove and re-add the service with --header"})
-			return
-		}
-		headers[s.UpstreamHeader] = v
-	}
-	switch s.Source.Type {
-	case config.SourceMCPURL:
-		tools, err := mcpproxy.ListTools(ctx, s.Source.URL, headers)
-		if err != nil {
-			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "start the app that serves " + s.Source.URL})
-			return
-		}
-		r.add(Check{Name: name, Status: OK, Detail: toolSummary(tools, s.Tools)})
-	case config.SourceStdio:
+	if s.Source.Type == config.SourceStdio {
 		env, err := secrets.LoadEnv(e.Store, s.Name, s.Source.EnvNames)
 		if err != nil {
 			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "remove and re-add the service with its --env values"})
@@ -285,28 +271,61 @@ func (r *runner) localCheck(ctx context.Context, e Env, s config.Service) {
 			return
 		}
 		r.add(Check{Name: name, Status: OK, Detail: toolSummary(tools, s.Tools)})
+		return
+	}
+	if !s.HasUpstream() {
+		return
+	}
+	if s.UpstreamHeader != "" {
+		cname := "app credential: " + s.Name
+		cred, err := service.Credential(s, e.Store)
+		if err == nil {
+			_, _, err = cred.Get()
+		}
+		switch {
+		case err != nil && s.UpstreamHeaderFile != "":
+			r.add(Check{Name: cname, Status: Fail, Detail: err.Error(), Fix: "make sure the app wrote " + s.UpstreamHeaderFile + " with mode 0600, or `toprelay set-header " + s.Name + " --file …`"})
+			return
+		case err != nil:
+			r.add(Check{Name: cname, Status: Fail, Detail: err.Error(), Fix: "set it again: `toprelay set-header " + s.Name + " --stdin`"})
+			return
+		case s.UpstreamHeaderFile != "":
+			r.add(Check{Name: cname, Status: OK, Detail: s.UpstreamHeader + " from " + s.UpstreamHeaderFile})
+		default:
+			r.add(Check{Name: cname, Status: OK, Detail: s.UpstreamHeader + " from the keyring"})
+		}
+	}
+	up, err := service.NewUpstream(s, e.Dir, e.Store)
+	if err != nil {
+		r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "check the service's URL, pin and caller key with `toprelay list`"})
+		return
+	}
+	kname := "caller key: " + s.Name
+	if k, err := upstream.ReadSecretFile(service.CallerKeyPath(e.Dir, s)); err != nil {
+		r.add(Check{Name: kname, Status: Fail, Detail: err.Error(), Fix: "run `toprelay caller-key " + s.Name + "`"})
+	} else if len(k) < caller.MinKeyLen {
+		r.add(Check{Name: kname, Status: Fail, Detail: "shorter than 32 characters", Fix: "write a longer key, or `toprelay caller-key " + s.Name + " --default`"})
+	} else {
+		r.add(Check{Name: kname, Status: OK, Detail: service.CallerKeyPath(e.Dir, s)})
+	}
+	where := up.Endpoint.Display()
+	if s.Pin != nil {
+		where += ", pinned to " + service.Pin(s).String()
+	}
+	switch s.Source.Type {
+	case config.SourceMCPURL:
+		tools, err := mcpproxy.ListTools(ctx, up.Endpoint.URL.String(), up.Client())
+		if err != nil {
+			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "start the app that serves " + where})
+			return
+		}
+		r.add(Check{Name: name, Status: OK, Detail: toolSummary(tools, s.Tools)})
 	case config.SourceHTTP:
-		d := net.Dialer{Timeout: 5 * time.Second}
-		u, err := url.Parse(s.Source.URL)
-		if err != nil {
-			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "re-add the service with a valid --http URL"})
+		if err := up.Dial(ctx); err != nil {
+			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "start the service at " + where})
 			return
 		}
-		host := u.Host
-		if u.Port() == "" {
-			if u.Scheme == "https" {
-				host += ":443"
-			} else {
-				host += ":80"
-			}
-		}
-		c, err := d.DialContext(ctx, "tcp", host)
-		if err != nil {
-			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "start the service at " + s.Source.URL})
-			return
-		}
-		c.Close()
-		r.add(Check{Name: name, Status: OK, Detail: s.Source.URL + " accepts connections"})
+		r.add(Check{Name: name, Status: OK, Detail: where + " accepts connections"})
 	}
 }
 

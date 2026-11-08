@@ -28,6 +28,8 @@ type inFrame struct {
 	Tools   *[]string         `json:"tools"`
 	Caps    []string          `json:"caps"`
 	MaxBody int64             `json:"maxBody"`
+	// Internal marks a request the agent answers itself ("file": a download), never the app.
+	Internal string `json:"internal"`
 }
 
 type helloFrame struct {

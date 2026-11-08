@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,27 +27,78 @@ const (
 
 	DefaultAllow = "allow"
 	DefaultDeny  = "deny"
+	// DefaultReadOnly exposes a tool in neither list only if its MCP annotations say it's read-only and not
+	// destructive. Destructive tools (destructiveHint, which MCP defaults to true for non-read-only tools) need an
+	// explicit allow.
+	DefaultReadOnly = "readonly"
 )
+
+// Hint is what a tool's MCP annotations say about it.
+type Hint struct {
+	Known       bool // the tool has been listed, so the hints below are real
+	ReadOnly    bool
+	Destructive bool
+}
+
+// ClientRule changes the policy for one client (or a group of clients): Deny hides tools, Allow exposes them,
+// both on top of the service's policy.
+type ClientRule struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
 
 // Config is the content of config.json.
 type Config struct {
-	AccountID     string    `json:"accountId,omitempty"`
-	AccountName   string    `json:"accountName,omitempty"`
-	Subdomain     string    `json:"subdomain,omitempty"`
-	PublicURL     string    `json:"publicUrl,omitempty"`
-	KVNamespaceID string    `json:"kvNamespaceId,omitempty"`
-	Services      []Service `json:"services"`
+	AccountID     string `json:"accountId,omitempty"`
+	AccountName   string `json:"accountName,omitempty"`
+	Subdomain     string `json:"subdomain,omitempty"`
+	PublicURL     string `json:"publicUrl,omitempty"`
+	KVNamespaceID string `json:"kvNamespaceId,omitempty"`
+	// LogRetentionDays drops call-log records older than this (0: keep until the size cap rotates them out).
+	LogRetentionDays int       `json:"logRetentionDays,omitempty"`
+	Services         []Service `json:"services"`
 }
 
 // Service is one exposed local app.
 type Service struct {
-	Name           string     `json:"name"`
-	Kind           string     `json:"kind"`
-	Source         Source     `json:"source"`
-	Gen            int        `json:"gen"`
-	Tools          ToolPolicy `json:"tools"`
-	AllowPaths     []string   `json:"allowPaths,omitempty"`
-	UpstreamHeader string     `json:"upstreamHeader,omitempty"`
+	Name       string     `json:"name"`
+	Kind       string     `json:"kind"`
+	Source     Source     `json:"source"`
+	Gen        int        `json:"gen"`
+	Tools      ToolPolicy `json:"tools"`
+	AllowPaths []string   `json:"allowPaths,omitempty"`
+	// UpstreamHeader is the name of the header that carries the app's credential. Its value is in the keyring
+	// (secrets.UpstreamHeader), or, when UpstreamHeaderFile is set, read from that file on every request.
+	UpstreamHeader     string `json:"upstreamHeader,omitempty"`
+	UpstreamHeaderFile string `json:"upstreamHeaderFile,omitempty"`
+	// UpstreamHeaderRev goes up on every `set-header`, so a running `up` reloads the value without a restart.
+	UpstreamHeaderRev int `json:"upstreamHeaderRev,omitempty"`
+	// CallerKeyFile is an app-supplied key file for X-TopRelay-Caller; empty uses
+	// <config dir>/caller-keys/<name>.key.
+	CallerKeyFile string `json:"callerKeyFile,omitempty"`
+	// Pin requires the local app to be signed by a team (macOS).
+	Pin *Pin `json:"pin,omitempty"`
+	// Limits are the service's own rate limits, enforced in the agent.
+	Limits *Limits `json:"limits,omitempty"`
+	// FilesDir is the service's outbox: files the app writes there can be linked as toprelay-file:///<name>.
+	FilesDir string `json:"filesDir,omitempty"`
+}
+
+// Limits are rate limits as "N/s", "N/m", "N/h" or "N/d": for the whole service, for each client, and per tool
+// (all clients together). Empty strings mean no limit.
+type Limits struct {
+	Service string            `json:"service,omitempty"`
+	Client  string            `json:"client,omitempty"`
+	Tools   map[string]string `json:"tools,omitempty"`
+}
+
+// Empty reports whether no limit is set.
+func (l Limits) Empty() bool { return l.Service == "" && l.Client == "" && len(l.Tools) == 0 }
+
+// Pin is a code-signature requirement for the process serving the app.
+type Pin struct {
+	TeamID   string `json:"teamId"`
+	BundleID string `json:"bundleId,omitempty"`
 }
 
 // Source says where the local app is.
@@ -69,29 +121,105 @@ type ToolPolicy struct {
 	Allow   []string `json:"allow"`
 	Deny    []string `json:"deny"`
 	Default string   `json:"default"`
+	// Clients are per-client rules, keyed by selector: an exact client id (an OAuth client id, or "key:<id>" for
+	// a bearer key), a prefix ending in "*", or a domain ("claude.ai") that matches OAuth client ids which are
+	// URLs on that host or its subdomains.
+	Clients map[string]ClientRule `json:"clients,omitempty"`
 }
 
-// Allowed reports whether a tool is exposed.
-func (p ToolPolicy) Allowed(tool string) bool {
+// Base reports whether the service policy exposes a tool, before client rules.
+func (p ToolPolicy) Base(tool string, h Hint) bool {
 	if slices.Contains(p.Deny, tool) {
 		return false
 	}
 	if slices.Contains(p.Allow, tool) {
 		return true
 	}
-	return p.Default == DefaultAllow
+	switch p.Default {
+	case DefaultAllow:
+		return true
+	case DefaultReadOnly:
+		return h.Known && h.ReadOnly && !h.Destructive
+	}
+	return false
 }
 
-// AllowsAll reports whether every tool, present and future, is exposed (hello `tools: null`).
+// Allowed reports whether a tool is exposed, ignoring annotations and client rules (callers without hints).
+func (p ToolPolicy) Allowed(tool string) bool { return p.Base(tool, Hint{}) }
+
+// AllowedFor reports whether a tool is exposed to one client.
+func (p ToolPolicy) AllowedFor(tool, client string, h Hint) bool {
+	if r, ok := p.RuleFor(client); ok {
+		if slices.Contains(r.Deny, tool) {
+			return false
+		}
+		if slices.Contains(r.Allow, tool) {
+			return true
+		}
+	}
+	return p.Base(tool, h)
+}
+
+// AllowedAny reports whether some client may use a tool: the set the relay is told about.
+func (p ToolPolicy) AllowedAny(tool string, h Hint) bool {
+	if p.Base(tool, h) {
+		return true
+	}
+	for _, r := range p.Clients {
+		if slices.Contains(r.Allow, tool) {
+			return true
+		}
+	}
+	return false
+}
+
+// RuleFor finds the rule for a client: an exact selector first, then the longest prefix, then the longest
+// matching domain.
+func (p ToolPolicy) RuleFor(client string) (ClientRule, bool) {
+	if len(p.Clients) == 0 || client == "" {
+		return ClientRule{}, false
+	}
+	if r, ok := p.Clients[client]; ok {
+		return r, true
+	}
+	best, bestLen, bestDomain := ClientRule{}, -1, false
+	host := ""
+	if u, err := url.Parse(client); err == nil && (u.Scheme == "https" || u.Scheme == "http") {
+		host = strings.ToLower(u.Hostname())
+	}
+	for sel, r := range p.Clients {
+		if pre, ok := strings.CutSuffix(sel, "*"); ok {
+			if strings.HasPrefix(client, pre) && (len(pre) > bestLen || bestDomain) {
+				best, bestLen, bestDomain = r, len(pre), false
+			}
+			continue
+		}
+		if host == "" || strings.Contains(sel, "://") || strings.HasPrefix(sel, "key:") || bestLen >= 0 && !bestDomain {
+			continue
+		}
+		d := strings.ToLower(sel)
+		if (host == d || strings.HasSuffix(host, "."+d)) && len(d) > bestLen {
+			best, bestLen, bestDomain = r, len(d), true
+		}
+	}
+	return best, bestLen >= 0
+}
+
+// AllowsAll reports whether every tool, present and future, is exposed to some client (hello `tools: null`).
 func (p ToolPolicy) AllowsAll() bool {
 	return p.Default == DefaultAllow && len(p.Deny) == 0
 }
 
-// AllowList returns the allowed names among the known tools, in their order.
+// AllowList returns the names among the known tools that some client may use, in their order.
 func (p ToolPolicy) AllowList(known []string) []string {
+	return p.AllowListHints(known, func(string) Hint { return Hint{} })
+}
+
+// AllowListHints is AllowList with each tool's annotations.
+func (p ToolPolicy) AllowListHints(known []string, hint func(string) Hint) []string {
 	out := []string{}
 	for _, t := range known {
-		if p.Allowed(t) && !slices.Contains(out, t) {
+		if p.AllowedAny(t, hint(t)) && !slices.Contains(out, t) {
 			out = append(out, t)
 		}
 	}
@@ -126,8 +254,16 @@ func (p *ToolPolicy) Normalize() {
 	if p.Deny == nil {
 		p.Deny = []string{}
 	}
-	if p.Default != DefaultAllow {
+	if p.Default != DefaultAllow && p.Default != DefaultReadOnly {
 		p.Default = DefaultDeny
+	}
+	for k, r := range p.Clients {
+		if len(r.Allow) == 0 && len(r.Deny) == 0 {
+			delete(p.Clients, k)
+		}
+	}
+	if len(p.Clients) == 0 {
+		p.Clients = nil
 	}
 }
 
@@ -323,6 +459,11 @@ func (s Service) LocalTarget() string {
 	default:
 		return s.Source.URL
 	}
+}
+
+// HasUpstream reports whether the service reaches its app over HTTP (an MCP URL or an http service).
+func (s Service) HasUpstream() bool {
+	return s.Source.Type == SourceMCPURL || s.Source.Type == SourceHTTP
 }
 
 // PublicPath is the path under PUBLIC_URL that bots use.

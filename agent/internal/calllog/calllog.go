@@ -33,6 +33,11 @@ type Record struct {
 	DurationMs int64     `json:"durationMs"`
 	Client     string    `json:"client,omitempty"`
 	Refused    bool      `json:"refused,omitempty"`
+	// Reason says why a call was refused or failed in the agent (tool_not_allowed, invalid_request,
+	// rate_limited, credential_unavailable, app_unreachable).
+	Reason   string `json:"reason,omitempty"`
+	BytesIn  int64  `json:"bytesIn"`
+	BytesOut int64  `json:"bytesOut"`
 }
 
 // Path is the log file for a service.
@@ -105,6 +110,60 @@ func (l *Log) Write(r Record) error {
 	return err
 }
 
+// Prune drops records older than before from the log and its rotated copy. A line that doesn't parse is kept.
+func (l *Log) Prune(before time.Time) (removed int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n, err := pruneFile(l.path+".1", before)
+	removed += n
+	if err != nil {
+		return removed, err
+	}
+	l.f.Close()
+	n, err = pruneFile(l.path, before)
+	removed += n
+	if oerr := l.open(); oerr != nil {
+		return removed, errors.Join(err, oerr)
+	}
+	return removed, err
+}
+
+func pruneFile(path string, before time.Time) (int, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var keep bytes.Buffer
+	removed := 0
+	for _, line := range bytes.SplitAfter(b, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var r struct {
+			Time time.Time `json:"time"`
+		}
+		if json.Unmarshal(line, &r) == nil && !r.Time.IsZero() && r.Time.Before(before) {
+			removed++
+			continue
+		}
+		keep.Write(line)
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	if keep.Len() == 0 {
+		return removed, os.Remove(path)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, keep.Bytes(), 0o600); err != nil {
+		return 0, err
+	}
+	return removed, os.Rename(tmp, path)
+}
+
 // Close closes the file.
 func (l *Log) Close() error {
 	l.mu.Lock()
@@ -115,6 +174,7 @@ func (l *Log) Close() error {
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	n      int64
 }
 
 func (s *statusWriter) WriteHeader(code int) {
@@ -128,7 +188,9 @@ func (s *statusWriter) Write(p []byte) (int, error) {
 	if s.status == 0 {
 		s.status = http.StatusOK
 	}
-	return s.ResponseWriter.Write(p)
+	n, err := s.ResponseWriter.Write(p)
+	s.n += int64(n)
+	return n, err
 }
 
 func (s *statusWriter) Flush() {
@@ -156,6 +218,9 @@ func (l *Log) Middleware(next http.Handler) http.Handler {
 				}
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
+			rec.BytesIn = int64(len(body))
+		} else if r.ContentLength > 0 {
+			rec.BytesIn = r.ContentLength
 		}
 		sw := &statusWriter{ResponseWriter: w}
 		defer func() {
@@ -164,6 +229,8 @@ func (l *Log) Middleware(next http.Handler) http.Handler {
 				rec.Status = http.StatusOK
 			}
 			rec.Refused = w.Header().Get(mcpproxy.RefusedHeader) != ""
+			rec.Reason = w.Header().Get(mcpproxy.ReasonHeader)
+			rec.BytesOut = sw.n
 			rec.DurationMs = time.Since(start).Milliseconds()
 			l.Write(rec)
 		}()
@@ -205,7 +272,7 @@ func Follow(ctx context.Context, path string, poll time.Duration, fn func(string
 	if st, err := os.Stat(path); err == nil {
 		offset = st.Size()
 	}
-	var partial []byte
+	var partial, lastLine []byte
 	for {
 		st, err := os.Stat(path)
 		switch {
@@ -214,9 +281,18 @@ func Follow(ctx context.Context, path string, poll time.Duration, fn func(string
 		case err != nil:
 			return err
 		default:
-			if st.Size() < offset { // rotated or truncated
+			if st.Size() < offset {
+				// Smaller: rotated, or pruned (old records removed, the rest kept). After a prune the last line
+				// printed is still there, so carry on after it instead of printing everything again.
 				offset = 0
 				partial = nil
+				if len(lastLine) > 0 {
+					if b, err := os.ReadFile(path); err == nil {
+						if i := bytes.LastIndex(b, append(append([]byte{}, lastLine...), '\n')); i >= 0 {
+							offset = int64(i + len(lastLine) + 1)
+						}
+					}
+				}
 			}
 			if st.Size() > offset {
 				f, err := os.Open(path)
@@ -236,6 +312,7 @@ func Follow(ctx context.Context, path string, poll time.Duration, fn func(string
 					if i < 0 {
 						break
 					}
+					lastLine = append(lastLine[:0], partial[:i]...)
 					fn(string(partial[:i]))
 					partial = partial[i+1:]
 				}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentKey, checkAgentKey, verifyBearer } from "../src/keys";
+import { agentKey, checkAgentKey, fileSig, verifyBearer, verifyFileUrl } from "../src/keys";
 import { AGENT_ROOT, BEARER_ROOT, mintKey } from "./helpers";
 import { GcraLimiter } from "../src/gcra";
 
@@ -74,5 +74,28 @@ describe("GCRA", () => {
     expect(limiter.take("k", t + 100).ok).toBe(true);
     expect(limiter.take("k", t + 100).ok).toBe(false);
     expect(limiter.take("other", t).ok).toBe(true);
+  });
+});
+
+describe("file links", () => {
+  const ID = "00112233445566778899aabbccddeeff";
+  // docs/protocol.md "Test vectors"; agent/internal/keys/files_test.go checks the same one.
+  it("matches the protocol vector", async () => {
+    expect(await fileSig(BEARER_ROOT, "notes", 1, ID, 1_793_500_900)).toBe("tBkr0_7eqyIbMb0KVCASzymzU0--l_J_ECGXjWMnLlY");
+  });
+
+  it("checks id, expiry and signature", async () => {
+    const exp = NOW + 600;
+    const s = await fileSig(BEARER_ROOT, "notes", 1, ID, exp);
+    expect(await verifyFileUrl(BEARER_ROOT, "notes", 1, ID, String(exp), s, NOW)).toEqual({ ok: true, exp });
+    expect(await verifyFileUrl(BEARER_ROOT, "notes", 2, ID, String(exp), s, NOW)).toMatchObject({ ok: false, status: 403 }); // rotated
+    expect(await verifyFileUrl(BEARER_ROOT, "other", 1, ID, String(exp), s, NOW)).toMatchObject({ ok: false, status: 403 });
+    expect(await verifyFileUrl(BEARER_ROOT, "notes", 1, ID, String(exp + 1), s, NOW)).toMatchObject({ ok: false, status: 403 });
+    expect(await verifyFileUrl(BEARER_ROOT, "notes", 1, ID, String(exp), s, exp)).toMatchObject({ ok: false, status: 410 });
+    expect(await verifyFileUrl(BEARER_ROOT, "notes", 1, "XYZ", String(exp), s, NOW)).toMatchObject({ ok: false, status: 404 });
+    expect(await verifyFileUrl(BEARER_ROOT, "notes", 1, ID, null, s, NOW)).toMatchObject({ ok: false, status: 404 });
+    // A link valid for longer than 15 minutes is never minted, so it's refused even with a good signature.
+    const far = NOW + 3600;
+    expect(await verifyFileUrl(BEARER_ROOT, "notes", 1, ID, String(far), await fileSig(BEARER_ROOT, "notes", 1, ID, far), NOW)).toMatchObject({ ok: false, status: 403 });
   });
 });

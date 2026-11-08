@@ -48,13 +48,17 @@ type Options struct {
 	BaseURL  string
 	Service  string
 	AgentKey string
-	Agent    string // e.g. "toprelay/0.1.0"
+	Agent    string // e.g. "toprelay/0.2.0"
 	Handler  http.Handler
 	Hello    func() Hello
 	// HelloChanged signals that Hello() changed; the client resends hello.
 	HelloChanged <-chan struct{}
 	Log          *slog.Logger
 	OnState      func(State)
+	// Files answers internal "file" requests (downloads). When set, hello offers the "files" capability.
+	Files http.Handler
+	// OnWelcome receives the relay's capabilities after each connect.
+	OnWelcome func(caps []string)
 
 	PingInterval     time.Duration // default 30 s
 	PongTimeout      time.Duration // default 10 s
@@ -103,7 +107,7 @@ func New(o Options) *Client {
 		o.Log = slog.New(slog.DiscardHandler)
 	}
 	if o.Agent == "" {
-		o.Agent = "toprelay/0.1.0"
+		o.Agent = "toprelay/0.2.0"
 	}
 	if o.Hello == nil {
 		o.Hello = func() Hello { return Hello{Kind: "mcp", AllowAll: true} }
@@ -314,6 +318,9 @@ func (c *Client) session(ctx context.Context, wsURL string) (time.Duration, erro
 		}
 		var f inFrame
 		if json.Unmarshal(msg, &f) == nil && f.Type == "welcome" {
+			if c.o.OnWelcome != nil {
+				c.o.OnWelcome(f.Caps)
+			}
 			break
 		}
 	}
@@ -417,6 +424,9 @@ func (c *Client) session(ctx context.Context, wsURL string) (time.Duration, erro
 func (c *Client) helloFrame() helloFrame {
 	h := c.o.Hello()
 	f := helloFrame{V: 1, Type: "hello", Agent: c.o.Agent, Caps: []string{}, Kind: h.Kind}
+	if c.o.Files != nil {
+		f.Caps = append(f.Caps, "files")
+	}
 	if !h.AllowAll && h.Kind != "http" {
 		tools := h.Tools
 		if tools == nil {
@@ -539,7 +549,19 @@ func (c *Client) handle(ctx context.Context, out sender, f inFrame) {
 				failure = "internal error"
 			}
 		}()
-		c.o.Handler.ServeHTTP(rw, req)
+		switch f.Internal {
+		case "":
+			c.o.Handler.ServeHTTP(rw, req)
+		case "file":
+			if c.o.Files == nil {
+				http.Error(rw, "toprelay agent: this agent doesn't share files", http.StatusNotFound)
+				return
+			}
+			c.o.Files.ServeHTTP(rw, req)
+		default:
+			// An internal kind this agent doesn't know: never let it fall through to the app.
+			http.Error(rw, "toprelay agent: unknown internal request", http.StatusNotFound)
+		}
 	}()
 	rw.finish(failure)
 }

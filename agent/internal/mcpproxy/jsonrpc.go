@@ -115,6 +115,20 @@ type Allowed func(tool string) bool
 // FilterResult filters a tools/list result object, keeping the order of the remaining tools and every other
 // field (ttlMs, cacheScope, nextCursor, _meta …). It returns the filtered result and every tool name seen.
 func FilterResult(result json.RawMessage, allowed Allowed) (json.RawMessage, []string, error) {
+	return FilterResultLearn(result, allowed, nil)
+}
+
+// ToolHint is a listed tool's annotations. Destructive follows MCP's default: true unless the tool is read-only
+// or says destructiveHint: false.
+type ToolHint struct {
+	Name        string
+	ReadOnly    bool
+	Destructive bool
+}
+
+// FilterResultLearn is FilterResult that first reports every listed tool's annotations to learn, so the policy
+// can use them for this very listing.
+func FilterResultLearn(result json.RawMessage, allowed Allowed, learn func([]ToolHint)) (json.RawMessage, []string, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(result, &obj); err != nil {
 		return nil, nil, err
@@ -129,15 +143,41 @@ func FilterResult(result json.RawMessage, allowed Allowed) (json.RawMessage, []s
 	}
 	kept := make([]json.RawMessage, 0, len(tools))
 	var seen []string
-	for _, t := range tools {
+	names := make([]string, len(tools))
+	var hints []ToolHint
+	for i, t := range tools {
 		var n struct {
-			Name string `json:"name"`
+			Name        string `json:"name"`
+			Annotations *struct {
+				ReadOnlyHint    bool  `json:"readOnlyHint"`
+				DestructiveHint *bool `json:"destructiveHint"`
+			} `json:"annotations"`
 		}
 		if json.Unmarshal(t, &n) != nil {
 			continue
 		}
-		seen = append(seen, n.Name)
-		if allowed(n.Name) {
+		names[i] = n.Name
+		h := ToolHint{Name: n.Name, Destructive: true}
+		if a := n.Annotations; a != nil {
+			h.ReadOnly = a.ReadOnlyHint
+			if a.DestructiveHint != nil {
+				h.Destructive = *a.DestructiveHint
+			}
+		}
+		if h.ReadOnly {
+			h.Destructive = false
+		}
+		hints = append(hints, h)
+	}
+	if learn != nil && len(hints) > 0 {
+		learn(hints)
+	}
+	for i, t := range tools {
+		if names[i] == "" {
+			continue
+		}
+		seen = append(seen, names[i])
+		if allowed(names[i]) {
 			kept = append(kept, t)
 		}
 	}
@@ -163,6 +203,11 @@ func marshalNoEscape(v any) ([]byte, error) {
 // FilterMessage filters one JSON-RPC message if it answers a tools/list id. It returns the (possibly unchanged)
 // bytes, whether it changed, and the tool names seen.
 func FilterMessage(msg []byte, listIDs map[string]bool, allowed Allowed) ([]byte, bool, []string) {
+	return FilterMessageLearn(msg, listIDs, allowed, nil)
+}
+
+// FilterMessageLearn is FilterMessage with an annotations hook (FilterResultLearn).
+func FilterMessageLearn(msg []byte, listIDs map[string]bool, allowed Allowed, learn func([]ToolHint)) ([]byte, bool, []string) {
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(msg, &obj) != nil {
 		return msg, false, nil
@@ -171,7 +216,7 @@ func FilterMessage(msg []byte, listIDs map[string]bool, allowed Allowed) ([]byte
 	if !hasRes || !listIDs[IDKey(obj["id"])] {
 		return msg, false, nil
 	}
-	fr, seen, err := FilterResult(res, allowed)
+	fr, seen, err := FilterResultLearn(res, allowed, learn)
 	if err != nil {
 		return msg, false, nil
 	}
@@ -185,31 +230,7 @@ func FilterMessage(msg []byte, listIDs map[string]bool, allowed Allowed) ([]byte
 
 // FilterBody filters a JSON response body (one message or a batch).
 func FilterBody(body []byte, listIDs map[string]bool, allowed Allowed) ([]byte, []string) {
-	t := bytes.TrimSpace(body)
-	if len(t) > 0 && t[0] == '[' {
-		var arr []json.RawMessage
-		if json.Unmarshal(t, &arr) != nil {
-			return body, nil
-		}
-		var all []string
-		changed := false
-		for i, m := range arr {
-			nb, ch, seen := FilterMessage(m, listIDs, allowed)
-			arr[i] = nb
-			changed = changed || ch
-			all = append(all, seen...)
-		}
-		if !changed {
-			return body, all
-		}
-		out, err := marshalNoEscape(arr)
-		if err != nil {
-			return body, all
-		}
-		return out, all
-	}
-	out, _, seen := FilterMessage(body, listIDs, allowed)
-	return out, seen
+	return TransformBody(body, ListTransform(listIDs, allowed))
 }
 
 // Decision is the guard's verdict on a request body.
@@ -223,7 +244,17 @@ type Decision struct {
 	Tools   []string // refused tool names
 	// ListIDs are the ids of tools/list requests, for filtering the response.
 	ListIDs map[string]bool
+	// CallIDs are the ids of allowed tools/call requests, for rewriting file links in the response.
+	CallIDs map[string]bool
 	Msgs    []Message
+}
+
+// Reason is the call-log reason for a refusal.
+func (d Decision) Reason() string {
+	if d.Invalid {
+		return ReasonInvalid
+	}
+	return ReasonToolNotAllowed
 }
 
 // RefusedLabel is the RefusedHeader value for a refusal: the refused tools, or why the body was refused.
@@ -237,7 +268,7 @@ func (d Decision) RefusedLabel() string {
 // Decide applies the allow-list to a request body. headerName is the Mcp-Name header when Mcp-Method is
 // tools/call ("" otherwise).
 func Decide(body []byte, headerName, service string, allowed Allowed) Decision {
-	d := Decision{ListIDs: map[string]bool{}, Status: http.StatusOK}
+	d := Decision{ListIDs: map[string]bool{}, CallIDs: map[string]bool{}, Status: http.StatusOK}
 	msgs, batch, err := Parse(body)
 	if err != nil {
 		// Never forward what the guard can't read exactly as the app would.
@@ -265,6 +296,8 @@ func Decide(body []byte, headerName, service string, allowed Allowed) Decision {
 				refused[i], anyRefused = name, true
 			} else if !batch && headerName != "" && headerName != name && !allowed(headerName) {
 				refused[i], anyRefused = headerName, true
+			} else if k := IDKey(m.ID); k != "" {
+				d.CallIDs[k] = true
 			}
 		case "tools/list":
 			if k := IDKey(m.ID); k != "" {

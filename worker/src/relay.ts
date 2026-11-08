@@ -41,6 +41,10 @@ interface Pending {
   mcpMethod: string | null;
   started: boolean;
   settled: boolean;
+  /** A file download: the response gets headers that keep it from running on the relay's origin. */
+  file?: boolean;
+  /** Called if the request ends before the agent started answering (offline, timeout, bot gone). */
+  onUnstarted?: () => void;
   resolve: (response: Response) => void;
   writer?: WritableStreamDefaultWriter<Uint8Array>;
   startTimer?: number;
@@ -62,6 +66,22 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
 const stopTimer = (timer: number | undefined) => {
   if (timer !== undefined) clearTimeout(timer);
 };
+
+/** Capabilities this relay offers in welcome (docs/protocol.md). */
+export const RELAY_CAPS = ["files"];
+
+const plainNoStore = { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" };
+
+/** A download is served from the relay's own origin, next to the OAuth consent page: it must never render or run
+ * there. Always an attachment, never sniffed, sandboxed if a browser opens it anyway. */
+export function secureDownload(headers: Headers) {
+  const cd = headers.get("content-disposition") ?? "";
+  if (!/^attachment\b/i.test(cd)) headers.set("content-disposition", "attachment");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("content-security-policy", "default-src 'none'; sandbox");
+  headers.set("cache-control", "no-store");
+  headers.set("referrer-policy", "no-referrer");
+}
 
 const today = (now: number) => new Date(now).toISOString().slice(0, 10);
 
@@ -130,6 +150,7 @@ export class Relay extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS used_files (id TEXT PRIMARY KEY, exp INTEGER NOT NULL)");
     this.revoked = new Set(this.getJson<string[]>("revoked") ?? []);
     this.delta = emptyUsage(today(Date.now()));
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -211,6 +232,8 @@ export class Relay extends DurableObject<Env> {
         return this.acceptAgent(request);
       case "/relay":
         return this.relay(request);
+      case "/file":
+        return this.file(request);
       case "/admin/status":
         return this.status(request);
       case "/admin/pair":
@@ -302,7 +325,7 @@ export class Relay extends DurableObject<Env> {
     };
     const attachment = (ws.deserializeAttachment() ?? { connectedAt: Math.floor(Date.now() / 1000) }) as Attachment;
     ws.serializeAttachment({ ...attachment, hello } satisfies Attachment);
-    ws.send(JSON.stringify({ v: 1, type: "welcome", caps: [], maxBody: MAX_BODY }));
+    ws.send(JSON.stringify({ v: 1, type: "welcome", caps: RELAY_CAPS, maxBody: MAX_BODY }));
   }
 
   private pendingFor(ws: WebSocket, frame: Record<string, unknown>): Pending | undefined {
@@ -318,6 +341,7 @@ export class Relay extends DurableObject<Env> {
     const id = frame.id as string;
     const status = typeof frame.status === "number" && frame.status >= 200 && frame.status <= 599 ? frame.status : 502;
     const headers = filterResponseHeaders(frame.headers as Record<string, unknown>);
+    if (p.file) secureDownload(headers);
     p.started = true;
     stopTimer(p.startTimer);
 
@@ -403,6 +427,7 @@ export class Relay extends DurableObject<Env> {
   }
 
   private settle(id: string, p: Pending) {
+    if (!p.settled && !p.started) p.onUnstarted?.();
     p.settled = true;
     stopTimer(p.startTimer);
     stopTimer(p.idleTimer);
@@ -482,40 +507,80 @@ export class Relay extends DurableObject<Env> {
     }
     this.count("requests");
 
-    const id = `${this.incarnation}-${++this.seq}`;
-    const frame = {
-      v: 1,
-      type: "request",
-      id,
+    return this.dispatch(agent.ws, { service, kind, rpc, mcpMethod }, request.signal, {
       method: h.get(INTERNAL.method) ?? "GET",
       path: h.get(INTERNAL.path) ?? "/",
       query: h.get(INTERNAL.query) ?? "",
       headers: forwardedRequestHeaders(h, h.get(INTERNAL.ip) ?? "", h.get(INTERNAL.host) ?? "", h.get(INTERNAL.client) ?? ""),
       ...(body.byteLength > 0 ? { body: bytesToB64(body) } : {}),
       ...(keyTools !== undefined ? { tools: keyTools } : {}),
-    };
+    });
+  }
 
+  /** Sends a request frame to the agent and resolves with its answer (or a timeout, cancel or offline answer). */
+  private dispatch(
+    ws: WebSocket,
+    meta: Pick<Pending, "service" | "kind" | "rpc" | "mcpMethod" | "file" | "onUnstarted">,
+    signal: AbortSignal | undefined,
+    fields: Record<string, unknown>,
+  ): Promise<Response> {
+    const id = `${this.incarnation}-${++this.seq}`;
+    const frame = { v: 1, type: "request", id, ...fields };
     return new Promise<Response>((resolve) => {
-      const p: Pending = {
-        ws: agent.ws,
-        service,
-        kind,
-        rpc,
-        mcpMethod,
-        started: false,
-        settled: false,
-        resolve,
-      };
+      const p: Pending = { ws, ...meta, started: false, settled: false, resolve };
       this.pending.set(id, p);
       p.startTimer = setTimeout(() => this.cancel(id, false), START_TIMEOUT_MS);
       p.totalTimer = setTimeout(() => this.cancel(id, false), TOTAL_TIMEOUT_MS);
-      request.signal?.addEventListener("abort", () => this.cancel(id, true));
+      signal?.addEventListener("abort", () => this.cancel(id, true));
       try {
-        agent.ws.send(JSON.stringify(frame));
+        ws.send(JSON.stringify(frame));
       } catch {
         this.settle(id, p);
         resolve(this.offlineAnswer(p));
       }
+    });
+  }
+
+  // ── file downloads (docs/protocol.md "Files"); the Worker already checked the signed URL ─────────────────────
+
+  private async file(request: Request): Promise<Response> {
+    const h = request.headers;
+    const service = h.get(INTERNAL.service) ?? "";
+    const id = h.get(INTERNAL.fileId) ?? "";
+    const exp = Number(h.get(INTERNAL.fileExp) ?? "0");
+    const now = Date.now();
+    const limited = this.requestLimiter.take("req", now);
+    if (!limited.ok) {
+      this.count("rejected");
+      return new Response("Too many requests.", { status: 429, headers: { "retry-after": String(Math.ceil(limited.retryAfterMs / 1000)) } });
+    }
+    // Single use: the id is remembered until its link would have expired anyway.
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM used_files WHERE exp < ?", Math.floor(now / 1000));
+    if (sql.exec("SELECT 1 FROM used_files WHERE id = ?", id).toArray().length > 0) {
+      this.count("rejected");
+      return new Response("This download link was already used. Ask for the file again.", { status: 410, headers: plainNoStore });
+    }
+    const agent = this.agentSocket();
+    if (!agent?.attachment.hello) {
+      this.count("rejected");
+      return new Response(offlineText(service), { status: 503, headers: { ...plainNoStore, "retry-after": "30" } });
+    }
+    if (!agent.attachment.hello.caps.includes("files")) {
+      this.count("rejected");
+      return new Response("The agent on the owner's computer is too old to share files. Ask them to update TopRelay.", { status: 503, headers: plainNoStore });
+    }
+    this.count("requests");
+    // Spent only now that the request goes to an agent that can serve it, and given back if it ends before the
+    // agent starts answering. Once bytes flow, it stays spent (a partial download can't be retried).
+    sql.exec("INSERT INTO used_files (id, exp) VALUES (?, ?)", id, exp);
+    const unspend = () => sql.exec("DELETE FROM used_files WHERE id = ?", id);
+    return this.dispatch(agent.ws, { service, kind: "file", rpc: { id: null }, mcpMethod: null, file: true, onUnstarted: unspend }, request.signal, {
+      method: "GET",
+      path: `/files/${id}`,
+      query: "",
+      internal: "file",
+      headers: forwardedRequestHeaders(new Headers(), h.get(INTERNAL.ip) ?? "", h.get(INTERNAL.host) ?? "", "file"),
     });
   }
 

@@ -5,8 +5,8 @@ The public side of TopRelay. The `toprelay` agent deploys it to the owner's own 
 
 | File | What |
 |---|---|
-| `src/index.ts` | Routing and credential checks. Bodies are streamed to the Durable Object, never read here |
-| `src/relay.ts` | `Relay` Durable Object, one per service: the agent's hibernatable WebSocket, request/stream relaying, cancellation, timeouts, offline and disallowed-tool answers, GCRA rate limit, pairing codes, revoked keys, usage counters |
+| `src/index.ts` | Routing and credential checks, including signed file-download links. Bodies are streamed to the Durable Object, never read here |
+| `src/relay.ts` | `Relay` Durable Object, one per service: the agent's hibernatable WebSocket, request/stream relaying, cancellation, timeouts, offline and disallowed-tool answers, single-use file downloads, GCRA rate limit, pairing codes, revoked keys, usage counters |
 | `src/oauth.ts` | One OAuth authorization server (CIMD + DCR), one protected resource per service, consent page with pairing code |
 | `src/keys.ts` | Agent keys and macaroon-style bearer keys |
 | `src/gcra.ts`, `src/headers.ts`, `src/mcp.ts`, `src/config.ts` | Rate limiting, header allow-lists, JSON-RPC answers, bindings |

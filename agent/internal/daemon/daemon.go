@@ -8,21 +8,29 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/harikanthl/toprelay/agent/internal/caller"
 	"github.com/harikanthl/toprelay/agent/internal/calllog"
 	"github.com/harikanthl/toprelay/agent/internal/config"
+	"github.com/harikanthl/toprelay/agent/internal/files"
 	"github.com/harikanthl/toprelay/agent/internal/keys"
+	"github.com/harikanthl/toprelay/agent/internal/mcpproxy"
 	"github.com/harikanthl/toprelay/agent/internal/redact"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
 	"github.com/harikanthl/toprelay/agent/internal/service"
 	"github.com/harikanthl/toprelay/agent/internal/tunnel"
+	"github.com/harikanthl/toprelay/agent/internal/upstream"
 )
 
 // Agent is the agent identifier sent in hello.
-const Agent = "toprelay/0.1.0"
+const Agent = "toprelay/0.2.0"
 
 // Daemon is `toprelay up`.
 type Daemon struct {
@@ -36,14 +44,24 @@ type Daemon struct {
 	PollInterval time.Duration
 	// TunnelOptions, if set, adjusts each tunnel's options (tests).
 	TunnelOptions func(*tunnel.Options)
+	// Tuning adjusts long-call timings (tests; zero: defaults).
+	Tuning service.Tuning
+	// State, if set, is the state file to use (the control socket subscribes to it); otherwise Run makes one.
+	State *StateFile
+	// Files holds offered files and download links (shared with the control socket); Run makes one if nil.
+	Files *files.Registry
 
-	state   *StateFile
-	mu      sync.Mutex
-	running map[string]*runner
+	state         *StateFile
+	retentionDays atomic.Int64
+	mu            sync.Mutex
+	running       map[string]*runner
 }
 
 type runner struct {
-	sig    string
+	sig string
+	// cred identifies the credential settings, which are applied live (no restart, no reconnect).
+	cred   string
+	limits string
 	cancel context.CancelFunc
 	done   chan struct{}
 	rt     *service.Runtime
@@ -57,8 +75,16 @@ func signature(base string, s config.Service) string {
 		Source config.Source
 		Gen    int
 		Paths  []string
-		Header string
-	}{base, s.Kind, s.Source, s.Gen, s.AllowPaths, s.UpstreamHeader})
+		Pin    *config.Pin
+		Files  string
+	}{base, s.Kind, s.Source, s.Gen, s.AllowPaths, s.Pin, s.FilesDir})
+	return string(b)
+}
+
+// credSignature identifies the credential settings; `set-header` bumps UpstreamHeaderRev when only the keyring
+// value changed.
+func credSignature(s config.Service) string {
+	b, _ := json.Marshal([]any{s.UpstreamHeader, s.UpstreamHeaderFile, s.UpstreamHeaderRev, s.CallerKeyFile})
 	return string(b)
 }
 
@@ -79,7 +105,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.PollInterval = 2 * time.Second
 	}
 	d.running = map[string]*runner{}
-	d.state = NewStateFile(StatePath(d.Dir), nil)
+	if d.Files == nil {
+		d.Files = files.NewRegistry()
+	}
+	d.state = d.State
+	if d.state == nil {
+		d.state = NewStateFile(StatePath(d.Dir), nil)
+	}
 	if err := d.state.Write(); err != nil {
 		return fmt.Errorf("write state file: %w", err)
 	}
@@ -164,6 +196,7 @@ func (d *Daemon) reconcile(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	d.retentionDays.Store(int64(cfg.LogRetentionDays))
 	agentRoot, err := secrets.Require(d.Store, secrets.AgentRoot, "run `toprelay add` to create it (or seed it for a local relay; see README)")
 	if err != nil {
 		return err
@@ -200,6 +233,23 @@ func (d *Daemon) reconcile(ctx context.Context, cfg *config.Config) error {
 		r := d.running[s.Name]
 		d.mu.Unlock()
 		if r != nil {
+			if cs := credSignature(s); cs != r.cred && s.HasUpstream() {
+				if err := d.applyCredential(r, s); err != nil {
+					d.Log.Error("can't apply the new upstream credential; keeping the old one", "service", s.Name, "err", err)
+					d.state.Update(s.Name, func(st *ServiceState) { st.LastError = redact.Log(err.Error()) })
+				} else {
+					r.cred = cs
+					d.Log.Info("upstream credential updated", "service", s.Name)
+				}
+			}
+			if ls := limitsSig(s); ls != r.limits {
+				if err := r.rt.SetLimits(s.Limits); err != nil {
+					d.Log.Error("bad rate limits; keeping the old ones", "service", s.Name, "err", err)
+				} else {
+					r.limits = ls
+					d.Log.Info("rate limits changed", "service", s.Name)
+				}
+			}
 			if !samePolicy(r.rt.Policy(), s.Tools) {
 				d.Log.Info("tool policy changed", "service", s.Name)
 				r.rt.SetPolicy(s.Tools)
@@ -214,6 +264,67 @@ func (d *Daemon) reconcile(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
+// applyCredential swaps a running service's credential and caller key file.
+func (d *Daemon) applyCredential(r *runner, s config.Service) error {
+	cred, err := service.Credential(s, d.Store)
+	if err != nil {
+		return err
+	}
+	keyPath := service.CallerKeyPath(d.Dir, s)
+	if s.CallerKeyFile == "" {
+		if _, err := caller.EnsureKeyFile(keyPath); err != nil {
+			return err
+		}
+	}
+	r.rt.SetCredential(cred)
+	r.rt.Upstream.SetCallerKeyFile(keyPath)
+	return nil
+}
+
+// linker turns a toprelay-file URI from the service's app into a signed, single-use relay URL.
+func (d *Daemon) linker(base, bearerRoot string, s config.Service, relayFiles *atomic.Bool) func(client, uri string) (mcpproxy.Link, error) {
+	return func(client, uri string) (mcpproxy.Link, error) {
+		if !relayFiles.Load() {
+			return mcpproxy.Link{}, errors.New("the relay on Cloudflare is older than this agent; the owner should run `toprelay deploy`")
+		}
+		e, err := d.Files.Resolve(s.Name, s.FilesDir, uri)
+		if err != nil {
+			return mcpproxy.Link{}, err
+		}
+		id, exp, err := d.Files.NewDownload(e, client, 0)
+		if err != nil {
+			return mcpproxy.Link{}, err
+		}
+		u, err := keys.FileURL(base, bearerRoot, s.Name, s.Gen, id, exp)
+		if err != nil {
+			return mcpproxy.Link{}, err
+		}
+		return mcpproxy.Link{URL: u, Name: e.Name, MimeType: e.ContentType, Size: e.Size}, nil
+	}
+}
+
+// downloads serves the relay's internal file requests: GET /files/<id>, each id once.
+func (d *Daemon) downloads(service string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, ok := strings.CutPrefix(r.URL.Path, "/files/")
+		if !ok || !keys.FileIDRE.MatchString(id) {
+			http.NotFound(w, r)
+			return
+		}
+		e, _, err := d.Files.Take(service, id)
+		if err != nil {
+			http.Error(w, "toprelay: "+err.Error()+". Ask for the file again.", http.StatusGone)
+			return
+		}
+		files.Serve(w, e)
+	})
+}
+
+func limitsSig(s config.Service) string {
+	b, _ := json.Marshal(s.Limits)
+	return string(b)
+}
+
 func samePolicy(a, b config.ToolPolicy) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
@@ -226,13 +337,11 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 		return err
 	}
 	redact.Add(key)
-	upstream := ""
-	if s.UpstreamHeader != "" {
-		v, err := secrets.Require(d.Store, secrets.UpstreamHeader(s.Name), "re-add the service with --header")
-		if err != nil {
+	var up *upstream.Upstream
+	if s.HasUpstream() {
+		if up, err = service.NewUpstream(s, d.Dir, d.Store); err != nil {
 			return err
 		}
-		upstream = v
 	}
 	// The stdio child's environment comes from the keyring, into a copy only: it never reaches config.json.
 	bs := s
@@ -249,16 +358,25 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 			if r.Refused {
 				st.Refused++
 			}
+			if r.Reason == mcpproxy.ReasonRateLimited {
+				st.Limited++
+			}
 		})
 	}
 	log := d.Log // every component logs the service name itself
-	rt, err := service.Build(bs, upstream, logw, log)
+	rt, err := service.BuildWith(bs, up, logw, log, d.Tuning)
 	if err != nil {
 		logw.Close()
 		return err
 	}
-	o := tunnel.Options{BaseURL: base, Service: s.Name, AgentKey: key, Agent: Agent, Handler: rt.Handler,
-		Hello: rt.Hello, HelloChanged: rt.HelloChanged(), Log: log,
+	var relayFiles atomic.Bool
+	var filesHandler http.Handler
+	if bearerRoot, berr := d.Store.Get(secrets.BearerRoot); berr == nil && rt.SetLinks(d.linker(base, bearerRoot, s, &relayFiles)) {
+		filesHandler = logw.Middleware(d.downloads(s.Name))
+	}
+	o := tunnel.Options{BaseURL: base, Service: s.Name, AgentKey: key, Agent: Agent, Handler: rt.Handler, Files: filesHandler,
+		OnWelcome: func(caps []string) { relayFiles.Store(slices.Contains(caps, "files")) },
+		Hello:     rt.Hello, HelloChanged: rt.HelloChanged(), Log: log,
 		OnState: func(ts tunnel.State) {
 			d.state.Update(s.Name, func(st *ServiceState) {
 				if ts.Connected {
@@ -277,7 +395,26 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 		d.TunnelOptions(&o)
 	}
 	sctx, cancel := context.WithCancel(ctx)
-	r := &runner{sig: signature(base, s), cancel: cancel, done: make(chan struct{}), rt: rt}
+	// Retention is read on every pass, so a change applies within the hour; 0 means no age limit.
+	prune := func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			if days := d.retentionDays.Load(); days > 0 {
+				if n, err := logw.Prune(time.Now().Add(-time.Duration(days) * 24 * time.Hour)); err != nil {
+					log.Warn("can't prune the call log", "service", s.Name, "err", err)
+				} else if n > 0 {
+					log.Info("pruned the call log", "service", s.Name, "records", n)
+				}
+			}
+			select {
+			case <-sctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}
+	r := &runner{sig: signature(base, s), cred: credSignature(s), limits: limitsSig(s), cancel: cancel, done: make(chan struct{}), rt: rt}
 	d.state.Update(s.Name, func(st *ServiceState) { *st = ServiceState{} })
 	d.mu.Lock()
 	d.running[s.Name] = r
@@ -286,6 +423,8 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 		defer close(r.done)
 		defer logw.Close()
 		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { defer wg.Done(); prune() }() // stops before logw.Close runs
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

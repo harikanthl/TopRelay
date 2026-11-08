@@ -67,7 +67,9 @@ var INTERNAL = {
   keyId: "x-toprelay-key-id",
   tools: "x-toprelay-tools",
   ip: "x-toprelay-ip",
-  host: "x-toprelay-host"
+  host: "x-toprelay-host",
+  fileId: "x-toprelay-file-id",
+  fileExp: "x-toprelay-file-exp"
 };
 function forwardedRequestHeaders(source, ip, host, client) {
   const out = {};
@@ -177,6 +179,21 @@ async function verifyBearer(bearerRoot, token, service, gen, now) {
     }
   }
   return { ok: true, claims: { id: i, service, expiresAt, tools: tools && [...tools] } };
+}
+var MAX_FILE_URL_TTL = 15 * 60;
+var FILE_SKEW = 60;
+var FILE_ID_RE = /^[0-9a-f]{32}$/;
+async function fileSig(bearerRoot, service, gen, id, exp) {
+  const fileKey = await hmac(b64urlDecode(bearerRoot), "toprelay/files/v1");
+  return b64urlEncode(await hmac(fileKey, `toprelay/file/v1/${service}/${gen}/${id}/${exp}`));
+}
+async function verifyFileUrl(bearerRoot, service, gen, id, e, s, now) {
+  if (!FILE_ID_RE.test(id) || !e || !/^\d{1,12}$/.test(e) || !s) return { ok: false, status: 404, reason: "not found" };
+  const exp = Number(e);
+  if (exp > now + MAX_FILE_URL_TTL + FILE_SKEW) return { ok: false, status: 403, reason: "bad link" };
+  if (!await stringsEqual(await fileSig(bearerRoot, service, gen, id, exp), s)) return { ok: false, status: 403, reason: "bad link" };
+  if (exp <= now) return { ok: false, status: 410, reason: "This download link expired. Ask for the file again." };
+  return { ok: true, exp };
 }
 
 // node_modules/@cloudflare/workers-oauth-provider/dist/oauth-provider.js
@@ -5729,6 +5746,16 @@ var json2 = (body, status = 200, headers = {}) => new Response(JSON.stringify(bo
 var stopTimer = (timer) => {
   if (timer !== void 0) clearTimeout(timer);
 };
+var RELAY_CAPS = ["files"];
+var plainNoStore = { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" };
+function secureDownload(headers) {
+  const cd = headers.get("content-disposition") ?? "";
+  if (!/^attachment\b/i.test(cd)) headers.set("content-disposition", "attachment");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("content-security-policy", "default-src 'none'; sandbox");
+  headers.set("cache-control", "no-store");
+  headers.set("referrer-policy", "no-referrer");
+}
 var today = (now) => new Date(now).toISOString().slice(0, 10);
 var emptyUsage = (day) => ({ day, requests: 0, rejected: 0, bytesIn: 0, bytesOut: 0 });
 function b64ToBytes(text2) {
@@ -5786,6 +5813,7 @@ var Relay = class extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS used_files (id TEXT PRIMARY KEY, exp INTEGER NOT NULL)");
     this.revoked = new Set(this.getJson("revoked") ?? []);
     this.delta = emptyUsage(today(Date.now()));
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -5856,6 +5884,8 @@ var Relay = class extends DurableObject {
         return this.acceptAgent(request);
       case "/relay":
         return this.relay(request);
+      case "/file":
+        return this.file(request);
       case "/admin/status":
         return this.status(request);
       case "/admin/pair":
@@ -5937,7 +5967,7 @@ var Relay = class extends DurableObject {
     };
     const attachment = ws.deserializeAttachment() ?? { connectedAt: Math.floor(Date.now() / 1e3) };
     ws.serializeAttachment({ ...attachment, hello });
-    ws.send(JSON.stringify({ v: 1, type: "welcome", caps: [], maxBody: MAX_BODY }));
+    ws.send(JSON.stringify({ v: 1, type: "welcome", caps: RELAY_CAPS, maxBody: MAX_BODY }));
   }
   pendingFor(ws, frame) {
     const id = frame.id;
@@ -5951,6 +5981,7 @@ var Relay = class extends DurableObject {
     const id = frame.id;
     const status = typeof frame.status === "number" && frame.status >= 200 && frame.status <= 599 ? frame.status : 502;
     const headers = filterResponseHeaders(frame.headers);
+    if (p.file) secureDownload(headers);
     p.started = true;
     stopTimer(p.startTimer);
     if (frame.stream === true) {
@@ -6026,6 +6057,7 @@ var Relay = class extends DurableObject {
     });
   }
   settle(id, p) {
+    if (!p.settled && !p.started) p.onUnstarted?.();
     p.settled = true;
     stopTimer(p.startTimer);
     stopTimer(p.idleTimer);
@@ -6094,39 +6126,69 @@ var Relay = class extends DurableObject {
       return this.offlineAnswer({ service, kind, rpc, mcpMethod });
     }
     this.count("requests");
-    const id = `${this.incarnation}-${++this.seq}`;
-    const frame = {
-      v: 1,
-      type: "request",
-      id,
+    return this.dispatch(agent.ws, { service, kind, rpc, mcpMethod }, request.signal, {
       method: h.get(INTERNAL.method) ?? "GET",
       path: h.get(INTERNAL.path) ?? "/",
       query: h.get(INTERNAL.query) ?? "",
       headers: forwardedRequestHeaders(h, h.get(INTERNAL.ip) ?? "", h.get(INTERNAL.host) ?? "", h.get(INTERNAL.client) ?? ""),
       ...body.byteLength > 0 ? { body: bytesToB64(body) } : {},
       ...keyTools !== void 0 ? { tools: keyTools } : {}
-    };
+    });
+  }
+  /** Sends a request frame to the agent and resolves with its answer (or a timeout, cancel or offline answer). */
+  dispatch(ws, meta, signal, fields) {
+    const id = `${this.incarnation}-${++this.seq}`;
+    const frame = { v: 1, type: "request", id, ...fields };
     return new Promise((resolve) => {
-      const p = {
-        ws: agent.ws,
-        service,
-        kind,
-        rpc,
-        mcpMethod,
-        started: false,
-        settled: false,
-        resolve
-      };
+      const p = { ws, ...meta, started: false, settled: false, resolve };
       this.pending.set(id, p);
       p.startTimer = setTimeout(() => this.cancel(id, false), START_TIMEOUT_MS);
       p.totalTimer = setTimeout(() => this.cancel(id, false), TOTAL_TIMEOUT_MS);
-      request.signal?.addEventListener("abort", () => this.cancel(id, true));
+      signal?.addEventListener("abort", () => this.cancel(id, true));
       try {
-        agent.ws.send(JSON.stringify(frame));
+        ws.send(JSON.stringify(frame));
       } catch {
         this.settle(id, p);
         resolve(this.offlineAnswer(p));
       }
+    });
+  }
+  // ── file downloads (docs/protocol.md "Files"); the Worker already checked the signed URL ─────────────────────
+  async file(request) {
+    const h = request.headers;
+    const service = h.get(INTERNAL.service) ?? "";
+    const id = h.get(INTERNAL.fileId) ?? "";
+    const exp = Number(h.get(INTERNAL.fileExp) ?? "0");
+    const now = Date.now();
+    const limited = this.requestLimiter.take("req", now);
+    if (!limited.ok) {
+      this.count("rejected");
+      return new Response("Too many requests.", { status: 429, headers: { "retry-after": String(Math.ceil(limited.retryAfterMs / 1e3)) } });
+    }
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM used_files WHERE exp < ?", Math.floor(now / 1e3));
+    if (sql.exec("SELECT 1 FROM used_files WHERE id = ?", id).toArray().length > 0) {
+      this.count("rejected");
+      return new Response("This download link was already used. Ask for the file again.", { status: 410, headers: plainNoStore });
+    }
+    const agent = this.agentSocket();
+    if (!agent?.attachment.hello) {
+      this.count("rejected");
+      return new Response(offlineText(service), { status: 503, headers: { ...plainNoStore, "retry-after": "30" } });
+    }
+    if (!agent.attachment.hello.caps.includes("files")) {
+      this.count("rejected");
+      return new Response("The agent on the owner's computer is too old to share files. Ask them to update TopRelay.", { status: 503, headers: plainNoStore });
+    }
+    this.count("requests");
+    sql.exec("INSERT INTO used_files (id, exp) VALUES (?, ?)", id, exp);
+    const unspend = () => sql.exec("DELETE FROM used_files WHERE id = ?", id);
+    return this.dispatch(agent.ws, { service, kind: "file", rpc: { id: null }, mcpMethod: null, file: true, onUnstarted: unspend }, request.signal, {
+      method: "GET",
+      path: `/files/${id}`,
+      query: "",
+      internal: "file",
+      headers: forwardedRequestHeaders(new Headers(), h.get(INTERNAL.ip) ?? "", h.get(INTERNAL.host) ?? "", "file")
     });
   }
   // ── admin ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -6244,6 +6306,20 @@ async function agentRoute(request, env, config, service, rest) {
   }
   return text("not found", 404);
 }
+async function fileRoute(request, env, service, id) {
+  if (request.method !== "GET") return text("method not allowed", 405);
+  const url = new URL(request.url);
+  const v = await verifyFileUrl(env.BEARER_ROOT, service.name, service.gen, id, url.searchParams.get("e"), url.searchParams.get("s"), Math.floor(Date.now() / 1e3));
+  if (!v.ok) return text(v.reason, v.status);
+  const headers = new Headers({
+    [INTERNAL.service]: service.name,
+    [INTERNAL.fileId]: id,
+    [INTERNAL.fileExp]: String(v.exp),
+    [INTERNAL.ip]: request.headers.get("cf-connecting-ip") ?? "",
+    [INTERNAL.host]: url.host
+  });
+  return relayStub(env, service).fetch("https://relay/file", { method: "POST", headers, signal: request.signal });
+}
 var index_default = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -6271,6 +6347,7 @@ var index_default = {
     if (!service) return text("not found", 404);
     const rest = segments.slice(1);
     if (rest[0] === "connect" || rest[0] === "admin") return agentRoute(request, env, config, service, rest);
+    if (service.kind === "mcp" && rest[0] === "files" && rest.length === 2) return fileRoute(request, env, service, rest[1]);
     if (service.kind === "mcp" && rest[0] !== "mcp") return text("not found", 404);
     return setup.resources.get(service.name).fetch(request, env, ctx);
   }

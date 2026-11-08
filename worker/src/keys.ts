@@ -108,3 +108,26 @@ export async function verifyBearer(bearerRoot: string, token: string, service: s
   }
   return { ok: true, claims: { id: i, service, expiresAt, tools: tools && [...tools] } };
 }
+
+/** Longest a signed file URL may be valid, plus clock skew allowance (docs/protocol.md "Files"). */
+export const MAX_FILE_URL_TTL = 15 * 60;
+const FILE_SKEW = 60;
+export const FILE_ID_RE = /^[0-9a-f]{32}$/;
+
+/** sig = b64url(HMAC(HMAC(BEARER_ROOT, "toprelay/files/v1"), "toprelay/file/v1/<service>/<gen>/<id>/<exp>")). */
+export async function fileSig(bearerRoot: string, service: string, gen: number, id: string, exp: number): Promise<string> {
+  const fileKey = await hmac(b64urlDecode(bearerRoot), "toprelay/files/v1");
+  return b64urlEncode(await hmac(fileKey, `toprelay/file/v1/${service}/${gen}/${id}/${exp}`));
+}
+
+export type FileUrlResult = { ok: true; exp: number } | { ok: false; status: number; reason: string };
+
+/** Checks a download URL's id, expiry and signature. */
+export async function verifyFileUrl(bearerRoot: string, service: string, gen: number, id: string, e: string | null, s: string | null, now: number): Promise<FileUrlResult> {
+  if (!FILE_ID_RE.test(id) || !e || !/^\d{1,12}$/.test(e) || !s) return { ok: false, status: 404, reason: "not found" };
+  const exp = Number(e);
+  if (exp > now + MAX_FILE_URL_TTL + FILE_SKEW) return { ok: false, status: 403, reason: "bad link" };
+  if (!(await stringsEqual(await fileSig(bearerRoot, service, gen, id, exp), s))) return { ok: false, status: 403, reason: "bad link" };
+  if (exp <= now) return { ok: false, status: 410, reason: "This download link expired. Ask for the file again." };
+  return { ok: true, exp };
+}

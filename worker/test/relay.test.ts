@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { agentKey } from "../src/keys";
-import { AGENT_ROOT, FakeAgent, b64, call, keyId, mcpHeaders, mintKey, rpc, unb64 } from "./helpers";
+import { fileSig } from "../src/keys";
+import { AGENT_ROOT, BEARER_ROOT, FakeAgent, b64, call, keyId, mcpHeaders, mintKey, rpc, unb64 } from "./helpers";
 
 const agents: FakeAgent[] = [];
 async function agent(service: string, opts: Parameters<typeof FakeAgent.connect>[1] = {}) {
@@ -115,6 +116,30 @@ describe("relaying", () => {
     expect(res.headers.get("set-cookie")).toBeNull();
   });
 
+  it("never lets a bot set the headers apps trust (x-toprelay-caller, x-toprelay-client, forwarded host)", async () => {
+    const a = await agent("notes");
+    const key = await notesKey();
+    const pending = call("/notes/mcp", {
+      method: "POST",
+      headers: {
+        ...mcpHeaders(key, { "mcp-method": "tools/list" }),
+        "x-toprelay-caller": "v1; client=forged; ts=1; nonce=00; sig=00",
+        "x-toprelay-client": "claude.ai",
+        "x-forwarded-host": "127.0.0.1",
+        "x-toprelay-service": "other",
+        host: "relay.test",
+      },
+      body: rpc(1, "tools/list"),
+    });
+    const req = await a.nextRequest();
+    expect(req.headers["x-toprelay-caller"]).toBeUndefined();
+    expect(req.headers["x-toprelay-client"]).toBe(`key:${keyId(key)}`);
+    expect(req.headers["x-forwarded-host"]).not.toBe("127.0.0.1");
+    expect(req.headers["x-toprelay-service"]).toBeUndefined();
+    a.respondJson(req.id, { jsonrpc: "2.0", id: 1, result: { tools: [] } });
+    expect((await pending).status).toBe(200);
+  });
+
   it("streams an SSE reply chunk by chunk", async () => {
     const a = await agent("notes");
     const pending = call("/notes/mcp", { method: "POST", headers: mcpHeaders(await notesKey()), body: rpc(2, "tools/call", { name: "slow" }) });
@@ -155,6 +180,35 @@ describe("relaying", () => {
     await reader.cancel();
     a.send({ type: "chunk", id: req.id, data: b64("data: 2\n\n") });
     await a.until(() => a.cancels.includes(req.id));
+  });
+
+  it("tells the agent when the bot hangs up before any answer (a slow tool call)", async () => {
+    const a = await agent("notes");
+    const ctl = new AbortController();
+    const res = call("/notes/mcp", { method: "POST", headers: mcpHeaders(await notesKey()), body: rpc(4, "tools/call", { name: "ocr" }), signal: ctl.signal });
+    const req = await a.nextRequest();
+    ctl.abort();
+    await res.catch(() => undefined);
+    await a.until(() => a.cancels.includes(req.id));
+  });
+
+  it("passes progress events through as they arrive, not at the end", async () => {
+    const a = await agent("notes");
+    const res = call("/notes/mcp", { method: "POST", headers: mcpHeaders(await notesKey()), body: rpc(5, "tools/call", { name: "render" }) });
+    const req = await a.nextRequest();
+    a.send({ type: "response", id: req.id, status: 200, headers: { "content-type": "text/event-stream" }, stream: true });
+    const reader = (await res).body!.getReader();
+    const decoder = new TextDecoder();
+    for (const event of [": keepalive\n\n", 'event: message\ndata: {"method":"notifications/progress"}\n\n']) {
+      a.send({ type: "chunk", id: req.id, data: b64(event) });
+      const { value } = await reader.read();
+      expect(decoder.decode(value)).toBe(event); // delivered before the next one is even sent
+    }
+    a.send({ type: "chunk", id: req.id, data: b64('event: message\ndata: {"id":5,"result":{}}\n\n') });
+    a.send({ type: "end", id: req.id });
+    const { value } = await reader.read();
+    expect(decoder.decode(value)).toContain('"id":5');
+    expect((await reader.read()).done).toBe(true);
   });
 
   it("fails pending requests at once when the agent disconnects", async () => {
@@ -303,5 +357,87 @@ describe("admin", () => {
     expect((await call("/notes/admin/pair", { method: "POST", headers, body: '{"code":"long-enough-code","ttl":5}' })).status).toBe(400);
     const ok = await (await call("/notes/admin/pair", { method: "POST", headers, body: '{"code":"long-enough-code"}' })).json<any>();
     expect(ok.expires).toBeGreaterThan(Date.now() / 1000);
+  });
+});
+
+describe("file downloads", () => {
+  const fileUrl = async (id: string, service = "notes", ttl = 600) => {
+    const exp = Math.floor(Date.now() / 1000) + ttl;
+    return `/${service}/files/${id}?e=${exp}&s=${await fileSig(BEARER_ROOT, service, 1, id, exp)}`;
+  };
+  const randomId = () => [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+  it("streams the agent's file once, as an attachment that can't run on the relay's origin", async () => {
+    const a = await agent("notes", { caps: ["files"] });
+    expect(a.welcome.caps).toContain("files");
+    const id = randomId();
+    const url = await fileUrl(id);
+    const pending = call(url); // no Authorization: the signed URL is the credential
+    const req = await a.nextRequest();
+    expect(req).toMatchObject({ method: "GET", path: `/files/${id}`, internal: "file" });
+    a.send({ type: "response", id: req.id, status: 200, stream: true,
+      headers: { "content-type": "text/html", "content-disposition": "inline", "set-cookie": "x=1" } });
+    a.send({ type: "chunk", id: req.id, data: b64("<script>alert(1)</script>") });
+    a.send({ type: "end", id: req.id });
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("<script>alert(1)</script>");
+    expect(res.headers.get("content-disposition")).toBe("attachment");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toBe("default-src 'none'; sandbox");
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("set-cookie")).toBeNull();
+
+    const again = await call(url);
+    expect(again.status).toBe(410);
+    expect(a.requests.length).toBe(1); // the second try never reached the agent
+  });
+
+  it("refuses bad, expired and foreign links before the Durable Object", async () => {
+    const a = await agent("notes", { caps: ["files"] });
+    const id = randomId();
+    const good = await fileUrl(id);
+    expect((await call(good.replace(/s=[^&]+/, "s=AAAA"))).status).toBe(403);
+    expect((await call(await fileUrl(id, "notes", -5))).status).toBe(410);
+    expect((await call(good.replace("/notes/", "/rotated/"))).status).toBe(403);
+    expect((await call(good, { method: "POST" })).status).toBe(405);
+    expect((await call(`/files/files/${id}?e=1&s=x`)).status).toBe(401); // http service: /files is the app's, behind its credential
+    expect(a.requests.length).toBe(0);
+  });
+
+  it("doesn't spend a link on a download that never reached an agent", async () => {
+    const id = randomId();
+    const url = await fileUrl(id);
+    expect((await call(url)).status).toBe(503); // nobody connected: retry later, as the 503 says
+    const old = await agent("notes"); // connected, but can't share files
+    expect((await call(url)).status).toBe(503);
+    old.close();
+    const a = await agent("notes", { caps: ["files"] });
+    const pending = call(url);
+    const req = await a.nextRequest();
+    a.send({ type: "response", id: req.id, status: 200, headers: { "content-type": "text/plain" }, body: b64("ok") });
+    expect(await (await pending).text()).toBe("ok");
+    expect((await call(url)).status).toBe(410); // now it's spent
+  });
+
+  it("gives the link back if the agent drops before answering", async () => {
+    const a = await agent("notes", { caps: ["files"] });
+    const url = await fileUrl(randomId());
+    const pending = call(url);
+    await a.nextRequest();
+    a.close();
+    expect((await pending).status).toBe(503);
+    const b = await agent("notes", { caps: ["files"] });
+    const again = call(url);
+    const req = await b.nextRequest();
+    b.send({ type: "response", id: req.id, status: 200, headers: { "content-type": "text/plain" }, body: b64("ok") });
+    expect((await again).status).toBe(200);
+  });
+
+  it("needs an agent that can share files", async () => {
+    await agent("notes"); // no "files" cap: an old agent would forward the path to the app
+    const res = await call(await fileUrl(randomId()));
+    expect(res.status).toBe(503);
+    expect(await res.text()).toContain("too old");
   });
 });

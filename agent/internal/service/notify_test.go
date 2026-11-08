@@ -15,7 +15,7 @@ func TestNotifyRemembersCurrentHello(t *testing.T) {
 	svc := config.Service{Name: "notes", Kind: "mcp", Gen: 1, Source: config.Source{Type: config.SourceMCPURL, URL: "http://127.0.0.1:1/mcp"},
 		Tools: config.ToolPolicy{Default: config.DefaultAllow, Deny: []string{"x"}}}
 	for round := 0; round < 300; round++ {
-		rt, err := Build(svc, "", nil, nil)
+		rt, err := build(t, svc)
 		if err != nil {
 			t.Fatal(err)
 		}

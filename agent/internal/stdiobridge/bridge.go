@@ -36,8 +36,12 @@ type Options struct {
 	Command []string
 	Env     map[string]string
 	Cwd     string
-	// Allowed is the current tool policy.
-	Allowed mcpproxy.Allowed
+	// Allowed is the current tool policy: the tools some client may use (they're mirrored). AllowedFor, if set,
+	// narrows it per client for each request.
+	Allowed    mcpproxy.Allowed
+	AllowedFor func(client string) mcpproxy.Allowed
+	// OnHints receives the child's tool annotations before the policy is applied to them.
+	OnHints func([]mcpproxy.ToolHint)
 	// OnToolsChanged is called when the set of exposed tools changes.
 	OnToolsChanged func()
 	Log            *slog.Logger
@@ -96,7 +100,7 @@ func New(o Options) *Bridge {
 		MaxRequestBodyBytes: mcpproxy.MaxBody})
 	b.sse = mcp.NewSSEHandler(get, &mcp.SSEOptions{DisableLocalhostProtection: true, MaxRequestBodyBytes: mcpproxy.MaxBody})
 	b.proxy = &mcpproxy.Proxy{Service: o.Service, Target: &url.URL{Scheme: "http", Host: "stdio.bridge", Path: "/mcp"},
-		Transport: mcpproxy.HandlerTransport{Handler: http.HandlerFunc(b.serveStreamable)}, Allowed: o.Allowed, Log: o.Log}
+		Transport: mcpproxy.HandlerTransport{Handler: http.HandlerFunc(b.serveStreamable)}, Allowed: o.Allowed, AllowedFor: o.AllowedFor, Log: o.Log}
 	return b
 }
 
@@ -219,7 +223,7 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 		default:
 		}
 	}
-	client := mcp.NewClient(&mcp.Implementation{Name: "toprelay", Version: "0.1.0"}, &mcp.ClientOptions{
+	client := mcp.NewClient(&mcp.Implementation{Name: "toprelay", Version: "0.2.0"}, &mcp.ClientOptions{
 		Capabilities:               &mcp.ClientCapabilities{},
 		ToolListChangedHandler:     func(context.Context, *mcp.ToolListChangedRequest) { changed() },
 		ResourceListChangedHandler: func(context.Context, *mcp.ResourceListChangedRequest) { changed() },
@@ -317,6 +321,10 @@ func (b *Bridge) sync(ctx context.Context, cs *mcp.ClientSession) error {
 			return err
 		}
 		tools = t
+	}
+	if b.o.OnHints != nil && len(tools) > 0 {
+		hs := mcpproxy.HintsFromTools(tools)
+		b.o.OnHints(hs)
 	}
 	var exposed []string
 	for _, t := range tools {
@@ -461,9 +469,14 @@ func (b *Bridge) serveSSE(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		restriction, restricted := reqctx.Tools(r.Context())
-		allowed := mcpproxy.Restrict(b.o.Allowed, restriction, restricted)
+		policy := b.o.Allowed
+		if b.o.AllowedFor != nil {
+			policy = b.o.AllowedFor(r.Header.Get("X-Toprelay-Client"))
+		}
+		allowed := mcpproxy.Restrict(policy, restriction, restricted)
 		if d := mcpproxy.Decide(body, "", b.o.Service, allowed); d.Refuse {
 			w.Header().Set(mcpproxy.RefusedHeader, d.RefusedLabel())
+			w.Header().Set(mcpproxy.ReasonHeader, d.Reason())
 			if d.Invalid {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(d.Status)
@@ -547,7 +560,7 @@ func ListChildTools(ctx context.Context, argv []string, env map[string]string, c
 	if err != nil {
 		return nil, err
 	}
-	client := mcp.NewClient(&mcp.Implementation{Name: "toprelay", Version: "0.1.0"}, &mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}})
+	client := mcp.NewClient(&mcp.Implementation{Name: "toprelay", Version: "0.2.0"}, &mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}})
 	cs, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd, TerminateDuration: 2 * time.Second}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("start %s: %w", strings.Join(argv, " "), err)

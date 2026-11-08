@@ -9,7 +9,7 @@ import (
 
 func TestBadGatewayHidesBaseURL(t *testing.T) {
 	base, _ := url.Parse("http://user:pa55word@127.0.0.1:1/app?token=s3cret")
-	f := New(base, []string{"/"}, "", "")
+	f := New(base, []string{"/"}, nil)
 	rec := httptest.NewRecorder()
 	f.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
 	if rec.Code != 502 {

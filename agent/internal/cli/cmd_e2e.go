@@ -104,11 +104,11 @@ the relay's added latency (compared with calling the local service directly). Ne
 		res.OK = true
 	} else {
 		res.Call = "GET " + s.AllowPaths[0]
-		hv, err := a.upstreamValue(s)
+		up, err := a.upstreamFor(s)
 		if err != nil {
 			return err
 		}
-		get := func(u string, h map[string]string) (int, time.Duration, error) {
+		get := func(client *http.Client, u string, h map[string]string) (int, time.Duration, error) {
 			req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 			if err != nil {
 				return 0, 0, err
@@ -117,7 +117,7 @@ the relay's added latency (compared with calling the local service directly). Ne
 				req.Header.Set(k, v)
 			}
 			t0 := time.Now()
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := client.Do(req)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -126,18 +126,14 @@ the relay's added latency (compared with calling the local service directly). Ne
 			return resp.StatusCode, time.Since(t0), nil
 		}
 		path := strings.TrimLeft(s.AllowPaths[0], "/")
-		lh := map[string]string{}
-		if s.UpstreamHeader != "" {
-			lh[s.UpstreamHeader] = hv
-		}
 		for range testRuns {
-			st, d, err := get(strings.TrimRight(base, "/")+"/"+s.Name+"/"+path, auth)
+			st, d, err := get(http.DefaultClient, strings.TrimRight(base, "/")+"/"+s.Name+"/"+path, auth)
 			if err != nil {
 				return errf("remote_failed", "run `toprelay doctor`", "through the relay: %v", err)
 			}
 			res.Status = st
 			remote = append(remote, d)
-			_, ld, err := get(strings.TrimRight(s.Source.URL, "/")+"/"+path, lh)
+			_, ld, err := get(up.Client(), up.Endpoint.Join("/"+path).String(), nil)
 			if err != nil {
 				return errf("local_failed", "start the service at "+s.Source.URL, "local service: %v", err)
 			}
@@ -173,15 +169,11 @@ the relay's added latency (compared with calling the local service directly). Ne
 func (a *App) localSession(ctx context.Context, s *config.Service) (*mcp.ClientSession, func(), error) {
 	switch s.Source.Type {
 	case config.SourceMCPURL:
-		hv, err := a.upstreamValue(s)
+		up, err := a.upstreamFor(s)
 		if err != nil {
 			return nil, nil, err
 		}
-		h := map[string]string{}
-		if s.UpstreamHeader != "" {
-			h[s.UpstreamHeader] = hv
-		}
-		cs, err := mcpproxy.Connect(ctx, s.Source.URL, mcpproxy.HTTPClientWithHeaders(nil, h))
+		cs, err := mcpproxy.Connect(ctx, up.Endpoint.URL.String(), up.Client())
 		if err != nil {
 			return nil, nil, errf("local_failed", "start the app that serves "+s.Source.URL, "%v", err)
 		}

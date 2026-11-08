@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInstallDarwinAndLinux(t *testing.T) {
@@ -83,5 +84,25 @@ func TestStateFile(t *testing.T) {
 	}
 	if f.Snapshot().Services["a"].Requests != 2 {
 		t.Fatal("snapshot")
+	}
+}
+
+// A service-manager command that leaves a helper holding its output pipe must not keep `up --install` from
+// exiting (the calling app waits for toprelay's own stdout to close).
+func TestRunBoundedReturnsDespiteLingeringChild(t *testing.T) {
+	start := time.Now()
+	if err := runBounded(10*time.Second, 300*time.Millisecond, "/bin/sh", "-c", "sleep 30 & echo started"); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("took %s: a lingering child held the pipe", d)
+	}
+	start = time.Now()
+	err := runBounded(300*time.Millisecond, 100*time.Millisecond, "/bin/sh", "-c", "sleep 30")
+	if err == nil || !strings.Contains(err.Error(), "didn't finish") || time.Since(start) > 5*time.Second {
+		t.Fatalf("timeout: %v after %s", err, time.Since(start))
+	}
+	if err := runBounded(5*time.Second, time.Second, "/bin/sh", "-c", "echo nope >&2; exit 3"); err == nil || !strings.Contains(err.Error(), "nope") {
+		t.Fatalf("failure output: %v", err)
 	}
 }

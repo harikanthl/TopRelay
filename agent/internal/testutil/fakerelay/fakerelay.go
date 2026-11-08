@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,8 @@ type Relay struct {
 	Server     *httptest.Server
 	// NoPong stops answering pings (to test the pong timeout).
 	NoPong atomic.Bool
+	// NoFiles makes the relay act like one deployed before file links (no "files" in welcome).
+	NoFiles atomic.Bool
 
 	mu        sync.Mutex
 	services  map[string]Service
@@ -67,6 +70,7 @@ type Relay struct {
 	revoked   map[string][]string
 	oauthRevs map[string]int
 	counter   atomic.Int64
+	usedFiles map[string]bool
 	t         testing.TB
 }
 
@@ -142,9 +146,57 @@ func (r *Relay) serve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		r.admin(w, req, svc, strings.TrimPrefix(rest, "admin/"))
+	case svc.Kind == "mcp" && strings.HasPrefix(rest, "files/"):
+		r.file(w, req, svc, strings.TrimPrefix(rest, "files/"))
 	default:
 		r.forward(w, req, svc, "/"+rest)
 	}
+}
+
+// file is the signed, single-use download route, checked as the Worker does.
+func (r *Relay) file(w http.ResponseWriter, req *http.Request, svc Service, id string) {
+	exp, err := strconv.ParseInt(req.URL.Query().Get("e"), 10, 64)
+	want, serr := keys.FileSig(r.BearerRoot, svc.Name, svc.Gen, id, exp)
+	if err != nil || serr != nil || !keys.FileIDRE.MatchString(id) || req.URL.Query().Get("s") != want {
+		http.Error(w, "bad link", http.StatusForbidden)
+		return
+	}
+	if exp <= time.Now().Unix() {
+		http.Error(w, "expired", http.StatusGone)
+		return
+	}
+	r.mu.Lock()
+	if r.usedFiles == nil {
+		r.usedFiles = map[string]bool{}
+	}
+	used := r.usedFiles[id]
+	r.usedFiles[id] = true
+	r.mu.Unlock()
+	if used {
+		http.Error(w, "already used", http.StatusGone)
+		return
+	}
+	x, err := r.Send(svc.Name, Request{Method: "GET", Path: "/files/" + id, Internal: "file",
+		Headers: map[string]string{"x-forwarded-proto": "https", "x-forwarded-host": req.Host, "x-toprelay-client": "file"}})
+	if err != nil {
+		http.Error(w, "offline", http.StatusServiceUnavailable)
+		return
+	}
+	resp, err := x.Collect(30 * time.Second)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusGatewayTimeout)
+		return
+	}
+	for k, v := range resp.Headers {
+		w.Header().Set(k, v)
+	}
+	w.Header().Set("Content-Disposition", "attachment")
+	if cd := resp.Headers["content-disposition"]; strings.HasPrefix(cd, "attachment") {
+		w.Header().Set("Content-Disposition", cd)
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(resp.Status)
+	w.Write(resp.Body)
 }
 
 func (r *Relay) accept(w http.ResponseWriter, req *http.Request, svc Service) {
@@ -175,7 +227,11 @@ func (r *Relay) accept(w http.ResponseWriter, req *http.Request, svc Service) {
 	r.hellos[svc.Name] = append(r.hellos[svc.Name], h.Hello)
 	r.connects[svc.Name]++
 	r.mu.Unlock()
-	ws.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"welcome","caps":[],"maxBody":20971520}`))
+	caps := `["files"]`
+	if r.NoFiles.Load() {
+		caps = `[]`
+	}
+	ws.Write(ctx, websocket.MessageText, []byte(`{"v":1,"type":"welcome","caps":`+caps+`,"maxBody":20971520}`))
 	defer func() {
 		close(s.closed)
 		r.mu.Lock()
@@ -283,6 +339,8 @@ type Request struct {
 	Headers map[string]string
 	Body    []byte
 	Tools   *[]string
+	// Internal is the frame's "internal" field ("file" for a download).
+	Internal string
 }
 
 // Exchange is an in-flight request: read Events until the channel closes.
@@ -315,6 +373,9 @@ func (r *Relay) Send(service string, rq Request) (*Exchange, error) {
 		"headers": rq.Headers, "body": base64.StdEncoding.EncodeToString(rq.Body)}
 	if rq.Tools != nil {
 		f["tools"] = *rq.Tools
+	}
+	if rq.Internal != "" {
+		f["internal"] = rq.Internal
 	}
 	b, _ := json.Marshal(f)
 	if err := s.ws.Write(context.Background(), websocket.MessageText, b); err != nil {

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // LaunchdLabel is the launchd agent label.
@@ -24,10 +26,36 @@ const SystemdUnit = "toprelay.service"
 // Runner runs a system command (replaced in tests).
 type Runner func(name string, args ...string) error
 
+// RunTimeout bounds one launchctl/systemctl run.
+const RunTimeout = 30 * time.Second
+
+// defaultRunner runs a service-manager command with no stdin, its output captured (never the caller's stdout or
+// stderr), a deadline, and a WaitDelay: if the command leaves a helper process holding the output pipe, Run still
+// returns, so `up --install` always exits.
 func defaultRunner(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
+	return runBounded(RunTimeout, 2*time.Second, name, args...)
+}
+
+func runBounded(timeout, waitDelay time.Duration, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out bytes.Buffer
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, &out, &out
+	cmd.WaitDelay = waitDelay
+	err := cmd.Run()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil // the command finished; a child it left behind kept the pipe open
+	}
 	if err != nil {
-		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		msg := strings.TrimSpace(out.String())
+		if len(msg) > 500 {
+			msg = msg[:500] + "…"
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s %s: didn't finish within %s", name, strings.Join(args, " "), timeout)
+		}
+		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, msg)
 	}
 	return nil
 }

@@ -44,3 +44,17 @@ jobs:
           cache-dependency-path: agent/go.sum
       - run: go vet ./...
       - run: go test -race ./...
+
+  toprelaykit:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+      - run: swift test
+        working-directory: TopRelayKit
+      - name: TopRelayKit against a real agent
+        working-directory: agent
+        run: TOPRELAY_SWIFT_TESTS=1 go test -run TestTopRelayKitEndToEnd ./internal/cli

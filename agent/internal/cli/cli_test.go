@@ -259,7 +259,12 @@ func TestCLIEndToEnd(t *testing.T) {
 		t.Fatalf("tools allow-all+deny %+v", tr)
 	}
 	e.runJSON(0, &tr, "tools", "notes", "--reset")
-	if tr.Policy.Default != "deny" || tr.Policy.Allowed("delete") || !tr.Policy.Allowed("search") {
+	// Reset honours annotations: read-only tools exposed (now and later), the rest need an explicit allow.
+	exposed := map[string]bool{}
+	for _, v := range tr.Tools {
+		exposed[v.Name] = v.Allowed
+	}
+	if tr.Policy.Default != "readonly" || exposed["delete"] || !exposed["search"] || !exposed["read"] {
 		t.Fatalf("tools reset %+v", tr)
 	}
 	e.runJSON(1, &eo, "tools", "web")
@@ -503,7 +508,9 @@ func TestInteractiveAdd(t *testing.T) {
 	cfg, _ := config.Load(e.dir)
 	p := cfg.Services[0].Tools
 	// Non-read-only tools are asked in server order (sorted): bad.name (y), delete (n).
-	if !p.Allowed("bad.name") || p.Allowed("delete") || !p.Allowed("search") {
+	ro := config.Hint{Known: true, ReadOnly: true}
+	rw := config.Hint{Known: true, Destructive: true}
+	if !p.Base("bad.name", rw) || p.Base("delete", rw) || !p.Base("search", ro) || p.Default != config.DefaultReadOnly {
 		t.Fatalf("policy %+v\n%s", p, out)
 	}
 	if !strings.Contains(out, "claude.ai") || !strings.Contains(out, "toprelay pair notes") || !strings.Contains(out, "Qwen") {

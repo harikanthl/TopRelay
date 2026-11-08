@@ -21,7 +21,7 @@ import (
 	"github.com/harikanthl/toprelay/agent/internal/testutil/fakerelay"
 )
 
-func upstream(t *testing.T) *httptest.Server {
+func upstreamServer(t *testing.T) *httptest.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "up", Version: "1"}, nil)
 	for _, n := range []string{"search", "delete", "read"} {
 		s.AddTool(&mcp.Tool{Name: n, InputSchema: json.RawMessage(`{"type":"object"}`)}, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -52,7 +52,7 @@ func TestUpEndToEnd(t *testing.T) {
 	store := &secrets.File{Path: dir + "/secrets.json"}
 	store.Set(secrets.AgentRoot, relay.AgentRoot)
 	store.Set(secrets.BearerRoot, relay.BearerRoot)
-	up := upstream(t)
+	up := upstreamServer(t)
 	cfg := &config.Config{PublicURL: "https://unused.example", Services: []config.Service{{Name: "notes", Kind: "mcp", Gen: 1,
 		Source: config.Source{Type: config.SourceMCPURL, URL: up.URL},
 		Tools:  config.ToolPolicy{Allow: []string{"search"}, Deny: []string{"delete"}, Default: config.DefaultDeny}}}}

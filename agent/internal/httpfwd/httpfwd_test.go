@@ -38,7 +38,7 @@ func TestForward(t *testing.T) {
 	}))
 	defer up.Close()
 	base, _ := url.Parse(up.URL)
-	f := New(base, []string{"/api"}, "X-Key", "k123")
+	f := New(base, []string{"/api"}, func(out *http.Request, _ []byte) error { out.Header.Set("X-Key", "k123"); return nil })
 	r := httptest.NewRequest("GET", "/api/items?x=1", nil)
 	r.Header.Set("X-Forwarded-For", "203.0.113.7")
 	w := httptest.NewRecorder()

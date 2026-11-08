@@ -17,10 +17,17 @@ type ServiceState struct {
 	NextRetryMs      int64      `json:"nextRetryMs"`
 	Requests         int64      `json:"requests"`
 	Refused          int64      `json:"refused"`
+	// Limited counts calls refused by the service's own rate limits (toprelay limits).
+	Limited int64 `json:"limited"`
 }
+
+// StateVersion is state.json's schema version. It goes up only for incompatible changes; new fields may appear
+// in any version.
+const StateVersion = 1
 
 // State is the content of state.json.
 type State struct {
+	Version   int                      `json:"version"`
 	PID       int                      `json:"pid"`
 	StartedAt time.Time                `json:"startedAt"`
 	UpdatedAt time.Time                `json:"updatedAt"`
@@ -37,6 +44,23 @@ type StateFile struct {
 	mu   sync.Mutex
 	s    State
 	now  func() time.Time
+	subs map[chan struct{}]struct{}
+}
+
+// Subscribe returns a channel that receives (coalesced) after every write, and a function to unsubscribe.
+func (f *StateFile) Subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	f.mu.Lock()
+	if f.subs == nil {
+		f.subs = map[chan struct{}]struct{}{}
+	}
+	f.subs[ch] = struct{}{}
+	f.mu.Unlock()
+	return ch, func() {
+		f.mu.Lock()
+		delete(f.subs, ch)
+		f.mu.Unlock()
+	}
 }
 
 // NewStateFile starts a fresh state for this process.
@@ -45,7 +69,7 @@ func NewStateFile(path string, now func() time.Time) *StateFile {
 		now = time.Now
 	}
 	t := now().UTC()
-	return &StateFile{path: path, now: now, s: State{PID: os.Getpid(), StartedAt: t, UpdatedAt: t, Running: true, Services: map[string]*ServiceState{}}}
+	return &StateFile{path: path, now: now, s: State{Version: StateVersion, PID: os.Getpid(), StartedAt: t, UpdatedAt: t, Running: true, Services: map[string]*ServiceState{}}}
 }
 
 // Update changes one service's state and writes the file.
@@ -124,10 +148,21 @@ func (f *StateFile) writeLocked() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, f.path)
+	if err := os.Rename(name, f.path); err != nil {
+		return err
+	}
+	for ch := range f.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
-// ReadState reads state.json (for `status` and the Mac app).
+// ReadState reads state.json (for `status` and the Mac app). A file from before versioning reads as version 1.
+// If it says running but its process is gone (the agent crashed or was killed), Running is set to false and every
+// service to disconnected.
 func ReadState(path string) (*State, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -136,6 +171,18 @@ func ReadState(path string) (*State, error) {
 	var s State
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, err
+	}
+	if s.Version == 0 {
+		s.Version = StateVersion
+	}
+	if s.Services == nil {
+		s.Services = map[string]*ServiceState{}
+	}
+	if s.Running && !processAlive(s.PID) {
+		s.Running = false
+		for _, st := range s.Services {
+			st.Connected, st.Since = false, nil
+		}
 	}
 	return &s, nil
 }

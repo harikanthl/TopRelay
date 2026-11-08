@@ -55,6 +55,7 @@ export interface RequestFrame {
   headers: Record<string, string>;
   body?: string;
   tools?: string[];
+  internal?: string;
 }
 
 type Frame = Record<string, unknown> & { type: string };
@@ -80,7 +81,7 @@ export class FakeAgent {
     });
   }
 
-  static async connect(service: string, opts: { tools?: string[] | null; gen?: number; key?: string } = {}): Promise<FakeAgent> {
+  static async connect(service: string, opts: { tools?: string[] | null; gen?: number; key?: string; caps?: string[] } = {}): Promise<FakeAgent> {
     const key = opts.key ?? (await agentKey(AGENT_ROOT, service, opts.gen ?? 1));
     const res = await call(`/${service}/connect`, { headers: { upgrade: "websocket", authorization: `Bearer ${key}` } });
     if (res.status !== 101 || !res.webSocket) throw new Error(`connect failed: ${res.status} ${await res.text()}`);
@@ -97,7 +98,7 @@ export class FakeAgent {
       };
       ws.addEventListener("message", onMessage);
     });
-    ws.send(JSON.stringify({ v: 1, type: "hello", agent: "toprelay/test", caps: [], kind: "mcp", tools: opts.tools ?? null }));
+    ws.send(JSON.stringify({ v: 1, type: "hello", agent: "toprelay/test", caps: opts.caps ?? [], kind: "mcp", tools: opts.tools ?? null }));
     return new FakeAgent(ws, await welcome);
   }
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/harikanthl/toprelay/agent/internal/config"
@@ -20,7 +21,7 @@ import (
 )
 
 // Version is the agent version.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // App holds the process's I/O and environment, so tests can drive commands.
 type App struct {
@@ -48,8 +49,17 @@ type App struct {
 	Exe          string
 	Home         string
 	Installer    func() installer
+	// Exit ends the process when a command overruns its --timeout and ignores cancellation (cmd/toprelay sets
+	// os.Exit). TimeoutGrace overrides TimeoutGrace (tests).
+	Exit         func(int)
+	TimeoutGrace time.Duration
 
-	in *bufio.Reader
+	in           *bufio.Reader
+	emittedError bool
+	// emitted is set once a command printed its result (emit); the watchdog reads it from another goroutine.
+	emitted atomic.Bool
+	// lingering, after Main, is closed when a command that overran its timeout finally returns (in process only).
+	lingering <-chan struct{}
 }
 
 // Error is a command failure with a machine code and a fix.
@@ -103,6 +113,11 @@ func commands() []command {
 		{"logs", "show a service's call log", cmdLogs},
 		{"key", "mint, narrow or revoke bearer keys", cmdKey},
 		{"pair", "make a pairing code for the OAuth consent page", cmdPair},
+		{"set-header", "change the app's credential header, live (no redeploy)", cmdSetHeader},
+		{"caller-key", "show or rotate the key apps use to verify X-TopRelay-Caller", cmdCallerKey},
+		{"limits", "rate limits per service, client and tool (429 + Retry-After)", cmdLimits},
+		{"files-dir", "let a service share files with bots from an outbox directory", cmdFilesDir},
+		{"deploy", "redeploy the relay Worker with this agent's version (keeps keys and grants)", cmdDeploy},
 		{"rotate", "invalidate a service's keys and OAuth grants", cmdRotate},
 		{"remove", "remove a service and revoke everything for it", cmdRemove},
 		{"doctor", "check the whole setup and say how to fix problems", cmdDoctor},
@@ -120,12 +135,15 @@ Usage: toprelay <command> [flags]   (add --json to most commands for machine-rea
 Commands:
 `, Version)
 	for _, c := range commands() {
-		fmt.Fprintf(w, "  %-8s %s\n", c.name, c.summary)
+		fmt.Fprintf(w, "  %-10s %s\n", c.name, c.summary)
 	}
 	fmt.Fprint(w, `
 Start with:  toprelay login
              toprelay add notes --mcp-url http://127.0.0.1:7879/mcp
              toprelay up
+
+Global flags: --json (one JSON object on stdout, never prompts), --timeout D (default 5m for one-shot commands;
+none for up, logs -f and status --watch). In --json mode at most 4 KiB goes to stderr.
 
 Environment: TOPRELAY_CONFIG_DIR, TOPRELAY_KEYRING=file, TOPRELAY_RELAY_URL (see README).
 `)
@@ -163,12 +181,23 @@ func Main(args []string, a *App) int {
 	if a.IsTTY == nil {
 		a.IsTTY = func() bool { return false }
 	}
+	if a.Stdin == nil {
+		a.Stdin = strings.NewReader("")
+	}
 	a.in = bufio.NewReader(a.Stdin)
 	args, a.JSON = stripJSON(args)
-	// Never print a registered secret, on any stream.
-	realOut := a.Stdout
-	a.Stdout = redact.Writer{W: realOut}
+	// Never print a registered secret, on any stream. Stdout is guarded so a timeout error and a late result can't
+	// both be printed; in --json mode stderr is capped, so an app that never reads it can't block us.
+	out := &guardWriter{w: a.Stdout}
+	a.Stdout = redact.Writer{W: out}
+	if a.JSON {
+		a.Stderr = &capWriter{w: a.Stderr, left: MaxJSONStderr}
+	}
 	a.Stderr = redact.Writer{W: a.Stderr, Keys: true}
+	args, timeout, timeoutSet, terr := stripTimeout(args)
+	if terr != nil {
+		return a.fail(terr)
+	}
 
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
 		if len(args) > 1 {
@@ -196,12 +225,23 @@ func Main(args []string, a *App) int {
 	}
 	for _, c := range commands() {
 		if c.name == args[0] {
-			err := c.run(a, args[1:])
+			d := timeout
+			if !timeoutSet {
+				d = DefaultTimeout
+				if longRunning(c.name, args[1:]) {
+					d = 0
+				}
+			}
+			err := a.runBounded(c.name, d, out, func() error { return c.run(a, args[1:]) })
 			if errors.Is(err, flag.ErrHelp) {
 				return 0
 			}
 			if errors.Is(err, errSilent) {
 				return 1
+			}
+			var ec exitCode
+			if errors.As(err, &ec) {
+				return int(ec)
 			}
 			if err != nil {
 				return a.fail(err)
@@ -213,6 +253,7 @@ func Main(args []string, a *App) int {
 }
 
 func (a *App) fail(err error) int {
+	a.emittedError = true
 	e := wrap("error", "", err)
 	e.Message = redact.Log(e.Message)
 	e.Fix = redact.Log(e.Fix)
@@ -234,6 +275,7 @@ func (a *App) fail(err error) int {
 
 // emit prints one JSON object in --json mode, or runs the human printer.
 func (a *App) emit(v any, human func()) error {
+	defer a.emitted.Store(true)
 	if a.JSON {
 		enc := json.NewEncoder(a.Stdout)
 		enc.SetEscapeHTML(false)

@@ -183,7 +183,7 @@ func newProxy(t *testing.T, up http.Handler) *Proxy {
 	srv := httptest.NewServer(up)
 	t.Cleanup(srv.Close)
 	u, _ := url.Parse(srv.URL + "/mcp")
-	return &Proxy{Service: "notes", Target: u, Allowed: allow("search", "read"), HeaderName: "X-App-Token", HeaderValue: "app-secret"}
+	return &Proxy{Service: "notes", Target: u, Allowed: allow("search", "read"), Prepare: func(out *http.Request, _ []byte) error { out.Header.Set("X-App-Token", "app-secret"); return nil }}
 }
 
 func post(p http.Handler, ctx context.Context, body string, hdr map[string]string) *httptest.ResponseRecorder {
@@ -267,7 +267,7 @@ func TestInProcAndListTools(t *testing.T) {
 	p := &Proxy{Service: "notes", Target: u, Transport: HandlerTransport{Handler: sdk}, Allowed: allow("search")}
 	front := httptest.NewServer(p)
 	defer front.Close()
-	tools, err := ListTools(context.Background(), front.URL+"/mcp", nil)
+	tools, err := ListTools(context.Background(), front.URL+"/mcp", http.DefaultClient)
 	if err != nil {
 		t.Fatal(err)
 	}

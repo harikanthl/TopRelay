@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -19,14 +21,21 @@ type ToolsResult struct {
 }
 
 func cmdTools(a *App, args []string) error {
-	fs := a.newFlags("tools", "tools <name> [--allow a,b] [--deny a,b] [--allow-all] [--reset]", `
+	fs := a.newFlags("tools", "tools <name> [--client SELECTOR] [--allow a,b] [--deny a,b] [--allow-all] [--reset]", `
 Show a service's tools with their status (exposed or hidden) and annotations, and change which are exposed.
 A running `+"`toprelay up`"+` picks the change up within seconds and tells the relay.
 
   --allow a,b   expose these tools
   --deny a,b    hide these tools
   --allow-all   expose every tool, including ones the server adds later
-  --reset       back to the default: read-only tools exposed, the rest hidden, new tools hidden`)
+  --reset       back to the default: tools whose MCP annotations say read-only are exposed (now and later);
+                destructive ones, and ones without annotations, only if you --allow them
+
+  --client SELECTOR   apply --allow/--deny/--reset to one client instead, on top of the service's policy:
+                      a domain (claude.ai, chatgpt.com, x.ai) matching OAuth client ids on that host,
+                      key:<id> for a bearer key, an exact client id, or a prefix ending in *.
+                      The client ids that called are in `+"`toprelay logs`"+`.`)
+	client := fs.String("client", "", "change the rule for one client (domain, key:<id>, client id, or prefix*)")
 	allow := fs.String("allow", "", "comma-separated tools to expose")
 	deny := fs.String("deny", "", "comma-separated tools to hide")
 	all := fs.Bool("allow-all", false, "expose every tool, present and future")
@@ -45,7 +54,7 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 	if s.Kind != config.KindMCP {
 		return errf("not_mcp", "use --allow-path on `add` for http services", "%s is an http service: it has no tools", s.Name)
 	}
-	hv, err := a.upstreamValue(s)
+	up, err := a.upstreamFor(s)
 	if err != nil {
 		return err
 	}
@@ -54,13 +63,50 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 		return err
 	}
 	res := ToolsResult{Service: s.Name}
-	tools, lerr := a.listLocalTools(s, hv, env)
+	tools, lerr := a.listLocalTools(s, up, env)
 	if lerr == nil {
 		res.Reachable = true
 	} else {
 		res.Error = lerr.Error()
 	}
 	p := s.Tools
+	var clientNames []string
+	if *client != "" {
+		if *all {
+			return usageErr("--allow-all is for the whole service; for a client, --allow the tools")
+		}
+		if strings.ContainsAny(*client, " \t,") {
+			return usageErr("bad --client selector %q", *client)
+		}
+		r := p.Clients[*client]
+		if *reset {
+			r = config.ClientRule{}
+		}
+		for _, t := range splitList(*allow) {
+			r.Deny = slices.DeleteFunc(r.Deny, func(x string) bool { return x == t })
+			if !slices.Contains(r.Allow, t) {
+				r.Allow = append(r.Allow, t)
+			}
+		}
+		for _, t := range splitList(*deny) {
+			r.Allow = slices.DeleteFunc(r.Allow, func(x string) bool { return x == t })
+			if !slices.Contains(r.Deny, t) {
+				r.Deny = append(r.Deny, t)
+			}
+		}
+		if p.Clients == nil {
+			p.Clients = map[string]config.ClientRule{}
+		} else {
+			p.Clients = maps.Clone(p.Clients)
+		}
+		p.Clients[*client] = r
+		res.Changed = *reset || *allow != "" || *deny != ""
+		clientNames = append(splitList(*allow), splitList(*deny)...)
+		*reset, *allow, *deny = false, "", "" // applied to the client, not the service
+		if !res.Changed {
+			return usageErr("--client needs --allow, --deny or --reset")
+		}
+	}
 	if *reset {
 		if lerr != nil {
 			return wrap("local_unreachable", "start the local server so its read-only tools can be found, then rerun --reset", lerr)
@@ -88,7 +134,7 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 			for _, t := range tools {
 				known[t.Name] = true
 			}
-			for _, n := range append(splitList(*allow), splitList(*deny)...) {
+			for _, n := range append(append(splitList(*allow), splitList(*deny)...), clientNames...) {
 				if !known[n] {
 					unknown = append(unknown, n)
 				}
@@ -128,10 +174,16 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 			a.say("  %s  %-30s %s\n", status, v.Name, strings.Join(hints, ", "))
 		}
 		def := "hidden"
-		if p.Default == config.DefaultAllow {
+		switch p.Default {
+		case config.DefaultAllow:
 			def = "exposed"
+		case config.DefaultReadOnly:
+			def = "exposed if read-only, hidden otherwise"
 		}
 		a.say("New tools the server adds later: %s\n", def)
+		for sel, r := range p.Clients {
+			a.say("Client %s: also exposed %s; hidden %s\n", sel, orNone(r.Allow), orNone(r.Deny))
+		}
 		if len(unknown) > 0 {
 			a.say("note: the server doesn't list %s right now; the setting is kept for when it does\n", strings.Join(unknown, ", "))
 		}
@@ -139,4 +191,11 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 			a.say("✓ saved; a running `toprelay up` applies it within a few seconds\n")
 		}
 	})
+}
+
+func orNone(s []string) string {
+	if len(s) == 0 {
+		return "none"
+	}
+	return strings.Join(s, ", ")
 }

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/harikanthl/toprelay/agent/internal/httpfwd"
 	"github.com/harikanthl/toprelay/agent/internal/reqctx"
@@ -20,9 +21,24 @@ import (
 // MaxBody is the largest request body accepted (the relay's cap).
 const MaxBody = 20 << 20
 
+// CallerHeader is the signed caller header (package caller); the proxy never forwards one it didn't make.
+const CallerHeader = "X-Toprelay-Caller"
+
 // RefusedHeader marks locally refused calls for the call log. It isn't on the relay's response allow-list, so it
 // never leaves the agent.
 const RefusedHeader = "X-Toprelay-Refused"
+
+// ReasonHeader carries why a call was refused or failed locally, for the call log (never leaves the agent).
+const ReasonHeader = "X-Toprelay-Reason"
+
+// Reasons in the call log.
+const (
+	ReasonToolNotAllowed = "tool_not_allowed"
+	ReasonInvalid        = "invalid_request"
+	ReasonCredential     = "credential_unavailable"
+	ReasonUnreachable    = "app_unreachable"
+	ReasonRateLimited    = "rate_limited"
+)
 
 // Proxy is a filtering reverse proxy to a Streamable HTTP MCP endpoint. It serves /mcp and /mcp/… .
 type Proxy struct {
@@ -30,13 +46,25 @@ type Proxy struct {
 	Target  *url.URL
 	// Transport reaches the upstream; nil uses a dedicated http.Transport.
 	Transport http.RoundTripper
-	// Allowed is the current tool policy.
-	Allowed Allowed
-	// Upstream header added to every request (from the keyring), if Name is set.
-	HeaderName, HeaderValue string
+	// Allowed is the current tool policy. AllowedFor, if set, replaces it with a per-client policy (client is the
+	// relay's X-Toprelay-Client).
+	Allowed    Allowed
+	AllowedFor func(client string) Allowed
+	// OnHints receives the annotations of every tool in a tools/list result, before the result is filtered.
+	OnHints func([]ToolHint)
+	// Prepare, if set, readies each upstream request: the app's credential and the X-TopRelay-Caller signature
+	// (upstream.Upstream.PrepareRelayed). body is the exact body sent.
+	Prepare func(out *http.Request, body []byte) error
 	// OnTools receives the names in every tools/list result (before filtering).
 	OnTools func([]string)
 	Log     *slog.Logger
+	// EarlySSE is how long a tools/call waits for the app's headers before the agent starts an SSE reply itself
+	// (0: DefaultEarlySSE; negative: never). KeepAlive is the longest an SSE reply goes without bytes
+	// (0: DefaultKeepAlive).
+	EarlySSE, KeepAlive time.Duration
+	// Links, if set, turns toprelay-file URIs in tools/call results into public links. client is the relay's
+	// X-Toprelay-Client.
+	Links func(client, uri string) (Link, error)
 }
 
 var hopHeaders = []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
@@ -67,7 +95,13 @@ func (p *Proxy) upstreamURL(r *http.Request) (*url.URL, bool) {
 		u.Path = p.Target.Path
 	}
 	u.RawPath = ""
-	u.RawQuery = r.URL.RawQuery
+	// The configured URL's own query (e.g. ?tenant=a) stays; the bot's is added after it.
+	switch {
+	case p.Target.RawQuery == "":
+		u.RawQuery = r.URL.RawQuery
+	case r.URL.RawQuery != "":
+		u.RawQuery = p.Target.RawQuery + "&" + r.URL.RawQuery
+	}
 	return &u, true
 }
 
@@ -98,7 +132,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body = b
 	}
 	restriction, restricted := reqctx.Tools(r.Context())
-	allowed := Restrict(p.Allowed, restriction, restricted)
+	policy := p.Allowed
+	if p.AllowedFor != nil {
+		policy = p.AllowedFor(r.Header.Get("X-Toprelay-Client"))
+	}
+	allowed := Restrict(policy, restriction, restricted)
 	headerName := ""
 	if strings.EqualFold(r.Header.Get("Mcp-Method"), "tools/call") {
 		headerName = r.Header.Get("Mcp-Name")
@@ -112,6 +150,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if d.Refuse {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set(RefusedHeader, d.RefusedLabel())
+		w.Header().Set(ReasonHeader, d.Reason())
 		w.Header().Set("Content-Length", strconv.Itoa(len(d.Body)))
 		w.WriteHeader(d.Status)
 		w.Write(d.Body)
@@ -134,30 +173,54 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(body) == 0 && r.Method != http.MethodPost && r.Method != http.MethodPut {
 		out.Body = http.NoBody
 	}
-	if p.HeaderName != "" {
-		out.Header.Set(p.HeaderName, p.HeaderValue)
+	// Only the agent may sign X-TopRelay-Caller; whatever arrived from the bot side is dropped.
+	out.Header.Del(CallerHeader)
+	if p.Prepare != nil {
+		if err := p.Prepare(out, body); err != nil {
+			if p.Log != nil {
+				p.Log.Error("can't prepare the upstream request", "service", p.Service, "err", err)
+			}
+			w.Header().Set(ReasonHeader, ReasonCredential)
+			p.answerUnavailable(w, d, fmt.Sprintf("%s: TopRelay can't get the credential for the local app right now. Ask its owner to run `toprelay doctor`.", p.Service), http.StatusBadGateway)
+			return
+		}
 	}
-	resp, err := p.transport().RoundTrip(out)
+	onSeen := func(seen []string) {
+		if p.OnTools != nil && len(seen) > 0 {
+			p.OnTools(seen)
+		}
+	}
+	xf := Chain(ListTransformLearn(d.ListIDs, allowed, p.OnHints), p.linkTransform(r, d))
+	ch := make(chan roundTrip, 1)
+	go func() {
+		resp, err := p.transport().RoundTrip(out)
+		ch <- roundTrip{resp, err}
+	}()
+	var rt roundTrip
+	if after := p.earlyAfter(); after > 0 && earlyEligible(r, d) {
+		t := time.NewTimer(after)
+		select {
+		case rt = <-ch:
+			t.Stop()
+		case <-t.C:
+			p.serveEarly(w, r, d, ch, xf, onSeen)
+			return
+		}
+	} else {
+		rt = <-ch
+	}
+	resp, err := rt.resp, rt.err
 	if err != nil {
 		if r.Context().Err() != nil {
 			panic(http.ErrAbortHandler)
 		}
-		msg := fmt.Sprintf("%s: the local MCP server isn't answering (%v). Ask its owner to check that the app is running.", p.Service, err)
+		// The bot gets no details: dial errors carry local paths, ports, pids and pin settings. They go to the log.
+		msg := fmt.Sprintf("%s: the local MCP server isn't answering. Ask its owner to check that the app is running.", p.Service)
 		if p.Log != nil {
 			p.Log.Warn("upstream unreachable", "service", p.Service, "err", err)
 		}
-		var id json.RawMessage
-		isCall := false
-		if len(d.Msgs) == 1 {
-			id, isCall = d.Msgs[0].ID, d.Msgs[0].Method == "tools/call"
-		}
-		if isCall {
-			b, _ := json.Marshal(response{JSONRPC: "2.0", ID: idOrNull(id), Result: toolResult{Content: []textContent{{Type: "text", Text: msg}}, IsError: true}})
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(b)
-			return
-		}
-		jsonRPCError(w, http.StatusBadGateway, id, msg)
+		w.Header().Set(ReasonHeader, ReasonUnreachable)
+		p.answerUnavailable(w, d, msg, http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -167,19 +230,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, h := range hopHeaders {
 		w.Header().Del(h)
 	}
-	onSeen := func(seen []string) {
-		if p.OnTools != nil && len(seen) > 0 {
-			p.OnTools(seen)
-		}
-	}
 	mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	switch {
-	case len(d.ListIDs) > 0 && mt == "application/json":
+	case xf != nil && mt == "application/json":
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			panic(http.ErrAbortHandler)
 		}
-		fb, seen := FilterBody(b, d.ListIDs, allowed)
+		fb, seen := TransformBody(b, xf)
 		onSeen(seen)
 		w.Header().Set("Content-Length", strconv.Itoa(len(fb)))
 		w.WriteHeader(resp.StatusCode)
@@ -190,7 +248,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		if err := FilterSSE(w, resp.Body, d.ListIDs, allowed, onSeen); err != nil && r.Context().Err() == nil {
+		ka := newKeepAlive(w, p.keepAliveEvery())
+		err := TransformSSE(ka, resp.Body, xf, onSeen)
+		ka.stop()
+		if err != nil && r.Context().Err() == nil {
 			panic(http.ErrAbortHandler)
 		}
 	default:
@@ -199,6 +260,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			panic(http.ErrAbortHandler)
 		}
 	}
+}
+
+// answerUnavailable answers a single tools/call with a tool error the model can relay, and anything else with a
+// JSON-RPC error.
+func (p *Proxy) answerUnavailable(w http.ResponseWriter, d Decision, msg string, status int) {
+	var id json.RawMessage
+	isCall := false
+	if len(d.Msgs) == 1 {
+		id, isCall = d.Msgs[0].ID, d.Msgs[0].Method == "tools/call"
+	}
+	if isCall {
+		b, _ := json.Marshal(response{JSONRPC: "2.0", ID: idOrNull(id), Result: toolResult{Content: []textContent{{Type: "text", Text: msg}}, IsError: true}})
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
+		return
+	}
+	jsonRPCError(w, status, id, msg)
 }
 
 func copyFlush(w io.Writer, r io.Reader) error {

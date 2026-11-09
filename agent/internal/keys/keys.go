@@ -4,6 +4,7 @@ package keys
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -64,6 +65,16 @@ func AgentKey(agentRoot, service string, gen int) (string, error) {
 		return "", err
 	}
 	return agentPrefix + b64.EncodeToString(mac(root, "toprelay/agent/v1/"+service+"/"+strconv.Itoa(gen))), nil
+}
+
+// AuditKey derives the Ed25519 key that signs call-log checkpoints from the base64url AGENT_ROOT. It needs no
+// storage of its own, and anyone holding the public key (`toprelay audit key`) can verify a log.
+func AuditKey(agentRoot string) (ed25519.PrivateKey, error) {
+	root, err := DecodeRoot(agentRoot)
+	if err != nil {
+		return nil, err
+	}
+	return ed25519.NewKeyFromSeed(mac(root, "toprelay/audit/v1")), nil
 }
 
 // NewKeyID returns a random 16-character lowercase hex key id.

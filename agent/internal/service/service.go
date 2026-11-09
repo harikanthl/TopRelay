@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"sync"
@@ -16,6 +17,8 @@ import (
 	"github.com/harikanthl/toprelay/agent/internal/httpfwd"
 	"github.com/harikanthl/toprelay/agent/internal/limits"
 	"github.com/harikanthl/toprelay/agent/internal/mcpproxy"
+	"github.com/harikanthl/toprelay/agent/internal/pins"
+	"github.com/harikanthl/toprelay/agent/internal/shield"
 	"github.com/harikanthl/toprelay/agent/internal/stdiobridge"
 	"github.com/harikanthl/toprelay/agent/internal/tunnel"
 	"github.com/harikanthl/toprelay/agent/internal/upstream"
@@ -39,6 +42,14 @@ type Runtime struct {
 	known     []string
 	hints     map[string]config.Hint
 	lastHello *tunnel.Hello
+	// descFindings are injection findings in each listed tool's description.
+	descFindings map[string][]shield.Finding
+
+	// pins holds tools whose definition changed since approval (nil: no pinning). shieldCfg is the live shield.
+	pins      atomic.Pointer[pins.Store]
+	shieldCfg atomic.Pointer[shield.Config]
+	// OnHeld, if set, is called with the tools that a listing newly held for review.
+	OnHeld func([]string)
 }
 
 // Build creates the runtime. up reaches the app (from NewUpstream; nil for stdio). logw, if non-nil, records every
@@ -63,22 +74,26 @@ func BuildWith(svc config.Service, up *upstream.Upstream, logw *calllog.Log, log
 	}
 	p := svc.Tools
 	rt.policy.Store(&p)
-	// Some client may use it: what's mirrored, listed to the relay, and the ceiling for every client.
-	allowed := func(tool string) bool { return rt.policy.Load().AllowedAny(tool, rt.hint(tool)) }
+	sc := svc.ShieldConfig()
+	rt.shieldCfg.Store(&sc)
+	// Some client may use it: what's mirrored, listed to the relay, and the ceiling for every client. A tool
+	// held for review is no one's.
+	allowed := func(tool string) bool { return !rt.IsHeld(tool) && rt.policy.Load().AllowedAny(tool, rt.hint(tool)) }
 	allowedFor := func(client string) mcpproxy.Allowed {
 		p := rt.policy.Load()
-		return func(tool string) bool { return p.AllowedFor(tool, client, rt.hint(tool)) }
+		return func(tool string) bool { return !rt.IsHeld(tool) && p.AllowedFor(tool, client, rt.hint(tool)) }
 	}
 	var h http.Handler
 	switch svc.Source.Type {
 	case config.SourceMCPURL:
 		rt.proxy = &mcpproxy.Proxy{Service: svc.Name, Target: up.Endpoint.URL, Transport: up.Transport(), Allowed: allowed,
-			AllowedFor: allowedFor, OnHints: rt.learnHints,
+			AllowedFor: allowedFor, OnHints: rt.learnHints, Held: rt.IsHeld, Shield: rt.ShieldConfig,
 			Prepare: up.PrepareRelayed, OnTools: rt.addKnown, Log: log, EarlySSE: tun.EarlySSE, KeepAlive: tun.KeepAlive}
 		h = rt.proxy
 	case config.SourceStdio:
 		rt.bridge = stdiobridge.New(stdiobridge.Options{Service: svc.Name, Command: svc.Source.Command, Env: svc.Source.Env,
-			Cwd: svc.Source.Cwd, Allowed: allowed, AllowedFor: allowedFor, OnHints: rt.learnHints, OnToolsChanged: rt.notify, Log: log})
+			Cwd: svc.Source.Cwd, Allowed: allowed, AllowedFor: allowedFor, OnHints: rt.learnHints, OnToolsChanged: rt.notify,
+			Held: rt.IsHeld, Shield: rt.ShieldConfig, Log: log})
 		h = rt.bridge
 	case config.SourceHTTP:
 		f := httpfwd.New(up.Endpoint.URL, svc.AllowPaths, up.PrepareRelayed)
@@ -129,6 +144,62 @@ func (rt *Runtime) SetLinks(fn func(client, uri string) (mcpproxy.Link, error)) 
 	return true
 }
 
+// SetPins turns on tool pinning with store (before Run). Tools already held stay hidden from the start.
+func (rt *Runtime) SetPins(store *pins.Store) {
+	rt.pins.Store(store)
+	rt.pinsChanged()
+}
+
+// IsHeld reports whether a tool is held for review because its definition changed.
+func (rt *Runtime) IsHeld(tool string) bool {
+	st := rt.pins.Load()
+	return st != nil && st.IsHeld(tool)
+}
+
+// Held returns the tools held for review.
+func (rt *Runtime) Held() []string {
+	if st := rt.pins.Load(); st != nil {
+		return st.Held()
+	}
+	return nil
+}
+
+// RefreshPins picks up approvals made by the CLI (or the Mac app through it). It reports whether the held set
+// changed.
+func (rt *Runtime) RefreshPins() (bool, error) {
+	st := rt.pins.Load()
+	if st == nil {
+		return false, nil
+	}
+	changed, err := st.Refresh()
+	if changed {
+		rt.log.Info("tool review changed", "service", rt.Svc.Name, "held", st.Held())
+		rt.pinsChanged()
+	}
+	return changed, err
+}
+
+// pinsChanged re-applies the policy where it is mirrored (the stdio bridge) and re-announces the hello.
+func (rt *Runtime) pinsChanged() {
+	if rt.bridge != nil {
+		rt.bridge.PolicyChanged()
+	}
+	rt.notify()
+}
+
+// ShieldConfig returns the live shield settings.
+func (rt *Runtime) ShieldConfig() shield.Config { return *rt.shieldCfg.Load() }
+
+// SetShield swaps the shield settings live.
+func (rt *Runtime) SetShield(c shield.Config) { rt.shieldCfg.Store(&c) }
+
+// DescriptionFindings returns injection findings in listed tools' descriptions, by tool.
+func (rt *Runtime) DescriptionFindings() map[string][]shield.Finding {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return maps.Clone(rt.descFindings)
+}
+
 // HelloChanged signals that Hello() changed.
 func (rt *Runtime) HelloChanged() <-chan struct{} { return rt.helloChanged }
 
@@ -161,8 +232,12 @@ func (rt *Runtime) hint(tool string) config.Hint {
 	return rt.hints[tool]
 }
 
-// learnHints records listed tools' annotations; a change may change the hello.
+// learnHints records listed tools' annotations, pins their definitions (holding changed ones), and scans
+// their descriptions; a change may change the hello. It runs before the listing is filtered, so a tool that
+// changes is hidden from the very listing that shows the change.
 func (rt *Runtime) learnHints(hs []mcpproxy.ToolHint) {
+	rt.observePins(hs)
+	rt.scanDescriptions(hs)
 	rt.mu.Lock()
 	if rt.hints == nil {
 		rt.hints = map[string]config.Hint{}
@@ -180,6 +255,65 @@ func (rt *Runtime) learnHints(hs []mcpproxy.ToolHint) {
 	rt.addKnown(names)
 	if changed {
 		rt.notify()
+	}
+}
+
+func (rt *Runtime) observePins(hs []mcpproxy.ToolHint) {
+	st := rt.pins.Load()
+	if st == nil {
+		return
+	}
+	tools := make([]pins.Tool, 0, len(hs))
+	for _, h := range hs {
+		tools = append(tools, pins.Tool{Name: h.Name, Fingerprint: h.Fingerprint, Description: h.Description})
+	}
+	held, err := st.Observe(tools)
+	if err != nil {
+		rt.log.Error("can't record tool pins", "service", rt.Svc.Name, "err", err)
+		return
+	}
+	if len(held) == 0 {
+		return
+	}
+	rt.log.Warn("tool definitions changed since they were approved; holding them for review (toprelay pins)",
+		"service", rt.Svc.Name, "tools", held)
+	if rt.OnHeld != nil {
+		rt.OnHeld(held)
+	}
+	rt.notify()
+}
+
+func (rt *Runtime) scanDescriptions(hs []mcpproxy.ToolHint) {
+	if rt.ShieldConfig().InjectionMode() == shield.InjectionOff {
+		return
+	}
+	found := map[string][]shield.Finding{}
+	for _, h := range hs {
+		if fs := shield.ScanText(h.Description); len(fs) > 0 {
+			found[h.Name] = fs
+		}
+	}
+	rt.mu.Lock()
+	if rt.descFindings == nil {
+		rt.descFindings = map[string][]shield.Finding{}
+	}
+	var fresh []string
+	for name, fs := range found {
+		if _, ok := rt.descFindings[name]; !ok {
+			fresh = append(fresh, name)
+		}
+		rt.descFindings[name] = fs
+	}
+	for _, h := range hs {
+		if _, ok := found[h.Name]; !ok {
+			delete(rt.descFindings, h.Name)
+		}
+	}
+	rt.mu.Unlock()
+	slices.Sort(fresh)
+	for _, name := range fresh {
+		rt.log.Warn("a tool description contains text that tries to instruct the model", "service", rt.Svc.Name,
+			"tool", name, "rules", shield.Rules(found[name]))
 	}
 }
 
@@ -218,8 +352,9 @@ func (rt *Runtime) helloLocked() tunnel.Hello {
 	if rt.bridge != nil {
 		return tunnel.Hello{Kind: config.KindMCP, Tools: rt.bridge.Exposed()}
 	}
-	// Explicitly allowed tools are always listed, even before the upstream has been seen.
-	return tunnel.Hello{Kind: config.KindMCP, Tools: p.AllowListHints(append(append(slices.Clone(rt.known), p.Allow...), clientAllows(p)...), func(t string) config.Hint { return rt.hints[t] })}
+	// Explicitly allowed tools are always listed, even before the upstream has been seen; held ones never are.
+	tools := p.AllowListHints(append(append(slices.Clone(rt.known), p.Allow...), clientAllows(p)...), func(t string) config.Hint { return rt.hints[t] })
+	return tunnel.Hello{Kind: config.KindMCP, Tools: slices.DeleteFunc(tools, rt.IsHeld)}
 }
 
 // notify signals a hello change when the hello differs from the last one. Computing and comparing under one lock

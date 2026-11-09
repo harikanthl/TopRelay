@@ -23,6 +23,7 @@ import (
 	"github.com/harikanthl/toprelay/agent/internal/daemon"
 	"github.com/harikanthl/toprelay/agent/internal/files"
 	"github.com/harikanthl/toprelay/agent/internal/keys"
+	"github.com/harikanthl/toprelay/agent/internal/pins"
 	"github.com/harikanthl/toprelay/agent/internal/relayapi"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
 	"github.com/harikanthl/toprelay/agent/internal/service"
@@ -482,6 +483,13 @@ out); a running `+"`toprelay up`"+` applies it within the hour.`)
 		if json.Unmarshal([]byte(line), &r) != nil {
 			return
 		}
+		switch r.Type {
+		case calllog.TypeCheckpoint:
+			return // chain bookkeeping; `toprelay audit verify` checks it
+		case calllog.TypePrune:
+			fmt.Fprintf(a.Stdout, "%s  retention removed %d older records\n", r.Time.Local().Format("2006-01-02 15:04:05"), r.Removed)
+			return
+		}
 		what := r.MCPMethod
 		if r.Tool != "" {
 			what += " " + r.Tool
@@ -493,7 +501,18 @@ out); a running `+"`toprelay up`"+` applies it within the hour.`)
 			}
 			what += ")"
 		}
-		fmt.Fprintf(a.Stdout, "%s  %-6s %-14s %-32s %3d %6dms  %s\n", r.Time.Local().Format("2006-01-02 15:04:05"), r.Method, r.Path, what, r.Status, r.DurationMs, r.Client)
+		var flags string
+		if len(r.Leaks) > 0 {
+			verb := "redacted"
+			if r.Blocked {
+				verb = "withheld"
+			}
+			flags += "  ⚠ " + verb + " " + strings.Join(r.Leaks, ",")
+		}
+		if len(r.Warnings) > 0 {
+			flags += "  ⚠ " + strings.Join(r.Warnings, ",")
+		}
+		fmt.Fprintf(a.Stdout, "%s  %-6s %-14s %-32s %3d %6dms  %s%s\n", r.Time.Local().Format("2006-01-02 15:04:05"), r.Method, r.Path, what, r.Status, r.DurationMs, r.Client, flags)
 	}
 	for _, l := range lines {
 		print(l)
@@ -608,6 +627,10 @@ keyring. Its call log is kept in <config dir>/logs.`)
 		if err := os.Remove(caller.DefaultKeyPath(a.Dir, name)); err != nil && !errors.Is(err, iofs.ErrNotExist) {
 			warnings = append(warnings, "couldn't delete the caller key: "+err.Error())
 		}
+	}
+	// A service added again later under this name starts with fresh pins.
+	if err := os.Remove(pins.Path(a.Dir, name)); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+		warnings = append(warnings, "couldn't delete the tool pins: "+err.Error())
 	}
 	return a.emit(map[string]any{"service": name, "removed": true, "oauthRevoked": revoked, "warnings": nonNil(warnings)}, func() {
 		a.say("✓ %s removed from the relay (%d OAuth grants revoked)\n", name, revoked)

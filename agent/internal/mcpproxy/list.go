@@ -6,6 +6,8 @@ import (
 	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/harikanthl/toprelay/agent/internal/pins"
 )
 
 // headerTransport adds fixed headers to every request.
@@ -76,7 +78,7 @@ func ToolNames(tools []*mcp.Tool) []string {
 func HintsFromTools(tools []*mcp.Tool) []ToolHint {
 	hs := make([]ToolHint, 0, len(tools))
 	for _, t := range tools {
-		h := ToolHint{Name: t.Name, Destructive: true}
+		h := ToolHint{Name: t.Name, Destructive: true, Description: t.Description}
 		if a := t.Annotations; a != nil {
 			h.ReadOnly = a.ReadOnlyHint
 			if a.DestructiveHint != nil {
@@ -86,6 +88,7 @@ func HintsFromTools(tools []*mcp.Tool) []ToolHint {
 		if h.ReadOnly {
 			h.Destructive = false
 		}
+		h.Fingerprint, _ = pins.FingerprintTool(t)
 		hs = append(hs, h)
 	}
 	return hs

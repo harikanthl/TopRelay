@@ -4,12 +4,16 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/harikanthl/toprelay/agent/internal/calllog"
 	"github.com/harikanthl/toprelay/agent/internal/config"
+	"github.com/harikanthl/toprelay/agent/internal/keys"
+	"github.com/harikanthl/toprelay/agent/internal/pins"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
 	"github.com/harikanthl/toprelay/agent/internal/testutil/cffake"
 )
@@ -83,5 +87,40 @@ func TestPermissionsAndDNS(t *testing.T) {
 	}
 	if c := find(r, "root secrets"); c.Status != Skip {
 		t.Errorf("roots with no services %+v", c)
+	}
+}
+
+func TestSecurityChecks(t *testing.T) {
+	dir := t.TempDir()
+	store := &secrets.File{Path: filepath.Join(dir, "s.json")}
+	root, _ := keys.NewRoot()
+	store.Set(secrets.AgentRoot, root)
+	store.Set(secrets.BearerRoot, root)
+	config.Save(dir, &config.Config{Services: []config.Service{{Name: "notes", Kind: "mcp", Gen: 1,
+		Source: config.Source{Type: config.SourceMCPURL, URL: "http://127.0.0.1:1/mcp"}}}})
+	// One tool changed since approval, and a signed log that someone edited.
+	st, _ := pins.Open(pins.Path(dir, "notes"))
+	st.Observe([]pins.Tool{{Name: "search", Fingerprint: "a"}})
+	st.Observe([]pins.Tool{{Name: "search", Fingerprint: "b"}})
+	l, _ := calllog.Open(calllog.Path(dir, "notes"))
+	ak, _ := keys.AuditKey(root)
+	l.SetSigner("notes", ak)
+	l.Write(calllog.Record{Time: time.Now().UTC(), Status: 200})
+	l.Write(calllog.Record{Time: time.Now().UTC(), Status: 200})
+	l.Close()
+
+	r := Run(context.Background(), Env{Dir: dir, Store: store})
+	if c := find(r, "tool pins: notes"); c.Status != Warn || !strings.Contains(c.Detail, "search") || !strings.Contains(c.Fix, "toprelay pins notes") {
+		t.Errorf("pins: %+v", c)
+	}
+	if c := find(r, "call log: notes"); c.Status != OK || !strings.Contains(c.Detail, "signed through 3") {
+		t.Errorf("log: %+v", c)
+	}
+	p := calllog.Path(dir, "notes")
+	b, _ := os.ReadFile(p)
+	os.WriteFile(p, []byte(strings.Replace(string(b), `"status":200`, `"status":500`, 1)), 0o600)
+	r = Run(context.Background(), Env{Dir: dir, Store: store})
+	if c := find(r, "call log: notes"); c.Status != Fail || !strings.Contains(c.Fix, "audit verify notes") {
+		t.Errorf("tampered log: %+v", c)
 	}
 }

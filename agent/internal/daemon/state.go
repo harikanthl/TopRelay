@@ -19,6 +19,13 @@ type ServiceState struct {
 	Refused          int64      `json:"refused"`
 	// Limited counts calls refused by the service's own rate limits (toprelay limits).
 	Limited int64 `json:"limited"`
+	// Leaks counts answers in which the shield redacted or withheld credentials; Warnings counts answers with
+	// text that tries to instruct the model.
+	Leaks    int64 `json:"leaks"`
+	Warnings int64 `json:"warnings"`
+	// Held lists tools whose definition changed since approval: hidden and refused until `toprelay pins`
+	// approves them.
+	Held []string `json:"held,omitempty"`
 }
 
 // StateVersion is state.json's schema version. It goes up only for incompatible changes; new fields may appear

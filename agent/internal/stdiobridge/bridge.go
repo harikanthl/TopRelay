@@ -25,6 +25,7 @@ import (
 	"github.com/harikanthl/toprelay/agent/internal/mcpproxy"
 	"github.com/harikanthl/toprelay/agent/internal/redact"
 	"github.com/harikanthl/toprelay/agent/internal/reqctx"
+	"github.com/harikanthl/toprelay/agent/internal/shield"
 )
 
 // ErrNotRunning is returned by forwarded calls while the child is (re)starting.
@@ -44,7 +45,11 @@ type Options struct {
 	OnHints func([]mcpproxy.ToolHint)
 	// OnToolsChanged is called when the set of exposed tools changes.
 	OnToolsChanged func()
-	Log            *slog.Logger
+	// Held reports tools held for review (pins); Allowed already refuses them. Shield returns the live shield
+	// settings (nil: no shield).
+	Held   func(tool string) bool
+	Shield func() shield.Config
+	Log    *slog.Logger
 	// MinRestart and MaxRestart bound the restart backoff (defaults 1 s and 30 s).
 	MinRestart, MaxRestart time.Duration
 	// SSEKeepAlive is the interval of SSE comment keepalives (default 25 s).
@@ -100,7 +105,8 @@ func New(o Options) *Bridge {
 		MaxRequestBodyBytes: mcpproxy.MaxBody})
 	b.sse = mcp.NewSSEHandler(get, &mcp.SSEOptions{DisableLocalhostProtection: true, MaxRequestBodyBytes: mcpproxy.MaxBody})
 	b.proxy = &mcpproxy.Proxy{Service: o.Service, Target: &url.URL{Scheme: "http", Host: "stdio.bridge", Path: "/mcp"},
-		Transport: mcpproxy.HandlerTransport{Handler: http.HandlerFunc(b.serveStreamable)}, Allowed: o.Allowed, AllowedFor: o.AllowedFor, Log: o.Log}
+		Transport: mcpproxy.HandlerTransport{Handler: http.HandlerFunc(b.serveStreamable)}, Allowed: o.Allowed, AllowedFor: o.AllowedFor,
+		Held: o.Held, Shield: o.Shield, Log: o.Log}
 	return b
 }
 
@@ -344,7 +350,11 @@ func (b *Bridge) sync(ctx context.Context, cs *mcp.ClientSession) error {
 			if cs == nil {
 				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.o.Service + ": " + ErrNotRunning.Error()}}, IsError: true}, nil
 			}
-			return cs.CallTool(ctx, &mcp.CallToolParams{Meta: r.Params.Meta, Name: name, Arguments: r.Params.Arguments})
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{Meta: r.Params.Meta, Name: name, Arguments: r.Params.Arguments})
+			if err != nil || res == nil {
+				return res, err
+			}
+			return b.shieldResult(ctx, res), nil
 		})
 		exposed = append(exposed, name)
 	}
@@ -376,7 +386,11 @@ func (b *Bridge) sync(ctx context.Context, cs *mcp.ClientSession) error {
 				if cs == nil {
 					return nil, ErrNotRunning
 				}
-				return cs.GetPrompt(ctx, r.Params)
+				res, err := cs.GetPrompt(ctx, r.Params)
+				if err != nil || res == nil {
+					return res, err
+				}
+				return shieldValue(ctx, b, res, func() *mcp.GetPromptResult { return &mcp.GetPromptResult{} })
 			})
 			prompts = append(prompts, p.Name)
 		}
@@ -422,7 +436,64 @@ func (b *Bridge) forwardRead(ctx context.Context, r *mcp.ReadResourceRequest) (*
 	if cs == nil {
 		return nil, ErrNotRunning
 	}
-	return cs.ReadResource(ctx, r.Params)
+	res, err := cs.ReadResource(ctx, r.Params)
+	if err != nil || res == nil {
+		return res, err
+	}
+	return shieldValue(ctx, b, res, func() *mcp.ReadResourceResult { return &mcp.ReadResourceResult{} })
+}
+
+// shieldResult redacts (or withholds) credentials in a tool result before it reaches either transport. The
+// Streamable HTTP path is also inspected by the proxy, which scans for injection text; the legacy SSE path
+// gets only this pass.
+func (b *Bridge) shieldResult(ctx context.Context, res *mcp.CallToolResult) *mcp.CallToolResult {
+	out, err := shieldValue(ctx, b, res, func() *mcp.CallToolResult { return &mcp.CallToolResult{} })
+	if err != nil {
+		// Never pass on an answer the shield couldn't check.
+		b.o.Log.Error("can't inspect a tool result; withholding it", "service", b.o.Service, "err", err)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: b.o.Service + ": TopRelay couldn't check this result, so it withheld it."}}, IsError: true}
+	}
+	return out
+}
+
+// shieldValue applies the shield's leak pass to a result value: it is encoded as a JSON-RPC response, inspected,
+// and decoded back into a fresh value from mk. The original is returned when nothing changed.
+func shieldValue[T any](ctx context.Context, b *Bridge, v *T, mk func() *T) (*T, error) {
+	if b.o.Shield == nil {
+		return v, nil
+	}
+	cfg := b.o.Shield()
+	if cfg.LeakMode() == shield.LeaksOff {
+		return v, nil
+	}
+	res, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	msg, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 0, "result": json.RawMessage(res)})
+	cfg.Injection = shield.InjectionOff // the proxy pass reports injection, once
+	out, changed, rep := cfg.InspectMessage(msg, b.o.Service)
+	mcpproxy.RecordShield(reqctx.FindingsFrom(ctx), rep, b.o.Log, b.o.Service)
+	if !changed {
+		return v, nil
+	}
+	var back struct {
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out, &back); err != nil {
+		return nil, err
+	}
+	if back.Error != nil {
+		return nil, errors.New(back.Error.Message)
+	}
+	nv := mk()
+	if err := json.Unmarshal(back.Result, nv); err != nil {
+		return nil, err
+	}
+	return nv, nil
 }
 
 func (b *Bridge) serveStreamable(w http.ResponseWriter, r *http.Request) {

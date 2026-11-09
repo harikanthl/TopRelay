@@ -246,6 +246,9 @@ func cmdAdd(a *App, args []string) error {
 		}
 		s.Tools = a.choosePolicy(name, tools, *toolsDefault, &warnings)
 		views = toolViews(name, tools, s.Tools)
+		if views, err = a.reviewTools(&s, tools, views, true); err != nil {
+			return err
+		}
 		allowed := 0
 		for _, v := range views {
 			warnings = append(warnings, v.Warnings...)

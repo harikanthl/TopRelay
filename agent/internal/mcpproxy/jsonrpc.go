@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+
+	"github.com/harikanthl/toprelay/agent/internal/pins"
 )
 
 // Message is the part of a JSON-RPC message the proxy looks at.
@@ -74,6 +76,11 @@ func RefusalText(tool, service string) string {
 	return fmt.Sprintf("The tool %q is not available on %s. Its owner hasn't allowed it.", tool, service)
 }
 
+// HeldText is the tool-result text for a tool whose definition changed since its owner approved it.
+func HeldText(tool, service string) string {
+	return fmt.Sprintf("The tool %q on %s changed since its owner approved it, so TopRelay is holding it until they review the change.", tool, service)
+}
+
 func idOrNull(id json.RawMessage) json.RawMessage {
 	if len(id) == 0 {
 		return json.RawMessage("null")
@@ -100,13 +107,17 @@ type response struct {
 
 // Refusal is the JSON-RPC response refusing a tool call.
 func Refusal(id json.RawMessage, tool, service string) []byte {
-	b, _ := json.Marshal(refusalResponse(id, tool, service))
+	b, _ := json.Marshal(refusalResponse(id, tool, service, nil))
 	return b
 }
 
-func refusalResponse(id json.RawMessage, tool, service string) response {
+func refusalResponse(id json.RawMessage, tool, service string, held func(string) bool) response {
+	text := RefusalText(tool, service)
+	if held != nil && held(tool) {
+		text = HeldText(tool, service)
+	}
 	return response{JSONRPC: "2.0", ID: idOrNull(id), Result: toolResult{
-		Content: []textContent{{Type: "text", Text: RefusalText(tool, service)}}, IsError: true}}
+		Content: []textContent{{Type: "text", Text: text}}, IsError: true}}
 }
 
 // Allowed decides whether a tool may be listed and called.
@@ -124,6 +135,9 @@ type ToolHint struct {
 	Name        string
 	ReadOnly    bool
 	Destructive bool
+	// Fingerprint is the definition's SHA-256 (package pins); Description is what the model reads.
+	Fingerprint string
+	Description string
 }
 
 // FilterResultLearn is FilterResult that first reports every listed tool's annotations to learn, so the policy
@@ -148,6 +162,7 @@ func FilterResultLearn(result json.RawMessage, allowed Allowed, learn func([]Too
 	for i, t := range tools {
 		var n struct {
 			Name        string `json:"name"`
+			Description string `json:"description"`
 			Annotations *struct {
 				ReadOnlyHint    bool  `json:"readOnlyHint"`
 				DestructiveHint *bool `json:"destructiveHint"`
@@ -157,7 +172,8 @@ func FilterResultLearn(result json.RawMessage, allowed Allowed, learn func([]Too
 			continue
 		}
 		names[i] = n.Name
-		h := ToolHint{Name: n.Name, Destructive: true}
+		h := ToolHint{Name: n.Name, Destructive: true, Description: n.Description}
+		h.Fingerprint, _ = pins.Fingerprint(t)
 		if a := n.Annotations; a != nil {
 			h.ReadOnly = a.ReadOnlyHint
 			if a.DestructiveHint != nil {
@@ -242,6 +258,8 @@ type Decision struct {
 	// Invalid is set when the body isn't a JSON-RPC message the guard can read safely (answered with -32700).
 	Invalid bool
 	Tools   []string // refused tool names
+	// Held is set when a refused tool is held for review (pins): its definition changed.
+	Held bool
 	// ListIDs are the ids of tools/list requests, for filtering the response.
 	ListIDs map[string]bool
 	// CallIDs are the ids of allowed tools/call requests, for rewriting file links in the response.
@@ -253,6 +271,9 @@ type Decision struct {
 func (d Decision) Reason() string {
 	if d.Invalid {
 		return ReasonInvalid
+	}
+	if d.Held {
+		return ReasonToolChanged
 	}
 	return ReasonToolNotAllowed
 }
@@ -268,6 +289,12 @@ func (d Decision) RefusedLabel() string {
 // Decide applies the allow-list to a request body. headerName is the Mcp-Name header when Mcp-Method is
 // tools/call ("" otherwise).
 func Decide(body []byte, headerName, service string, allowed Allowed) Decision {
+	return DecideHeld(body, headerName, service, allowed, nil)
+}
+
+// DecideHeld is Decide that explains refusals of held tools (held reports them; nil: none) as held for review.
+// allowed must already refuse held tools.
+func DecideHeld(body []byte, headerName, service string, allowed Allowed, held func(string) bool) Decision {
 	d := Decision{ListIDs: map[string]bool{}, CallIDs: map[string]bool{}, Status: http.StatusOK}
 	msgs, batch, err := Parse(body)
 	if err != nil {
@@ -315,10 +342,11 @@ func Decide(body []byte, headerName, service string, allowed Allowed) Decision {
 	for _, r := range refused {
 		if r != "" {
 			d.Tools = append(d.Tools, r)
+			d.Held = d.Held || (held != nil && held(r))
 		}
 	}
 	if !batch {
-		d.Body = Refusal(msgs[0].ID, refused[0], service)
+		d.Body, _ = json.Marshal(refusalResponse(msgs[0].ID, refused[0], service, held))
 		return d
 	}
 	// A batch with a refused call is answered whole, locally: nothing in it reaches the app.
@@ -328,7 +356,7 @@ func Decide(body []byte, headerName, service string, allowed Allowed) Decision {
 			continue // notifications get no response
 		}
 		if refused[i] != "" {
-			out = append(out, refusalResponse(m.ID, refused[i], service))
+			out = append(out, refusalResponse(m.ID, refused[i], service, held))
 			continue
 		}
 		out = append(out, response{JSONRPC: "2.0", ID: idOrNull(m.ID), Error: map[string]any{"code": -32600,

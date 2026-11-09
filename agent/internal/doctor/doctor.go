@@ -3,6 +3,7 @@ package doctor
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
@@ -14,11 +15,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/harikanthl/toprelay/agent/internal/caller"
+	"github.com/harikanthl/toprelay/agent/internal/calllog"
 	"github.com/harikanthl/toprelay/agent/internal/cfapi"
 	"github.com/harikanthl/toprelay/agent/internal/config"
 	"github.com/harikanthl/toprelay/agent/internal/deploy"
 	"github.com/harikanthl/toprelay/agent/internal/keys"
 	"github.com/harikanthl/toprelay/agent/internal/mcpproxy"
+	"github.com/harikanthl/toprelay/agent/internal/pins"
 	"github.com/harikanthl/toprelay/agent/internal/redact"
 	"github.com/harikanthl/toprelay/agent/internal/relayapi"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
@@ -225,6 +228,7 @@ func run(ctx context.Context, e Env) Report {
 	// Each local service, and the relay's view of its agent.
 	for _, s := range cfg.Services {
 		r.localCheck(ctx, e, s)
+		r.securityCheck(e, s, agentRoot, rootsOK)
 		name := "agent connected: " + s.Name
 		switch {
 		case relay == nil || !rootsOK:
@@ -243,6 +247,46 @@ func run(ctx context.Context, e Env) Report {
 		}
 	}
 	return r.r
+}
+
+// securityCheck reports tools held for review (pins) and whether the call log's chain checks out.
+func (r *runner) securityCheck(e Env, s config.Service, agentRoot string, rootsOK bool) {
+	if s.Kind == config.KindMCP {
+		name := "tool pins: " + s.Name
+		st, err := pins.Open(pins.Path(e.Dir, s.Name))
+		switch {
+		case err != nil:
+			r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "delete " + pins.Path(e.Dir, s.Name) + " to pin every tool again as it is now"})
+		case len(st.Held()) > 0:
+			r.add(Check{Name: name, Status: Warn, Detail: "changed since approval, held from bots: " + strings.Join(st.Held(), ", "),
+				Fix: "review with `toprelay pins " + s.Name + "`, then --approve what you trust"})
+		default:
+			r.add(Check{Name: name, Status: OK, Detail: fmt.Sprintf("%d tools pinned, none changed", len(st.Snapshot().Tools))})
+		}
+	}
+	name := "call log: " + s.Name
+	if !rootsOK {
+		r.add(Check{Name: name, Status: Skip, Detail: "needs the root secrets (the signing key comes from them)"})
+		return
+	}
+	key, err := keys.AuditKey(agentRoot)
+	if err != nil {
+		r.add(Check{Name: name, Status: Fail, Detail: err.Error()})
+		return
+	}
+	rep, err := calllog.Verify(calllog.Path(e.Dir, s.Name), s.Name, key.Public().(ed25519.PublicKey))
+	switch {
+	case err != nil:
+		r.add(Check{Name: name, Status: Fail, Detail: err.Error(), Fix: "check permissions on " + e.Dir})
+	case !rep.OK:
+		p := rep.Problems[0]
+		r.add(Check{Name: name, Status: Fail, Detail: fmt.Sprintf("%d problems; first: %s line %d: %s", len(rep.Problems), p.File, p.Line, p.What),
+			Fix: "run `toprelay audit verify " + s.Name + "` for details, and keep a copy of the log"})
+	case rep.LastSeq == 0:
+		r.add(Check{Name: name, Status: OK, Detail: "no calls yet"})
+	default:
+		r.add(Check{Name: name, Status: OK, Detail: fmt.Sprintf("chain intact (lines %d–%d, signed through %d)", rep.FirstSeq, rep.LastSeq, rep.SignedThrough)})
+	}
 }
 
 func errText(err error) string {

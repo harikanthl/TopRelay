@@ -16,6 +16,13 @@ tools each bot can use.
   network.
 - **Auth built in.** Every service needs OAuth or a bearer key, even if the local app has no auth of its own.
 - **You choose the tools.** Hide tools from the list, and refuse calls to tools you didn't allow.
+- **Rug-pull proof.** Every tool's definition is pinned by hash. If a server later changes what a tool says or
+  does, the tool is held, hidden and refused, until you review the change (`toprelay pins`).
+- **Leak-proof answers.** Before anything leaves your computer, API keys, tokens, private keys and the app's own
+  credentials are redacted. Text that tries to instruct the model (hidden Unicode, "ignore previous
+  instructions") is flagged (`toprelay shield`).
+- **Every call is provable.** The call log is hash-chained and signed with Ed25519, so `toprelay audit verify`
+  shows whether a single line was edited, inserted or removed.
 - **Apps can tell.** Every relayed call carries a signed `X-TopRelay-Caller` header, so an app knows for sure that
   a call is remote and which bot made it. Credentials come from a file or the keyring, never the command line, and
   can be changed live. Unix sockets and macOS code-signature pins stop another program from answering for the app.

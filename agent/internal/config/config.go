@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
+	"github.com/harikanthl/toprelay/agent/internal/shield"
 )
 
 // Service kinds and source types.
@@ -82,6 +83,17 @@ type Service struct {
 	Limits *Limits `json:"limits,omitempty"`
 	// FilesDir is the service's outbox: files the app writes there can be linked as toprelay-file:///<name>.
 	FilesDir string `json:"filesDir,omitempty"`
+	// Shield inspects the app's answers before they leave: credentials are redacted (or the answer withheld)
+	// and text that tries to instruct the model is flagged. Nil means the defaults (redact, warn).
+	Shield *shield.Config `json:"shield,omitempty"`
+}
+
+// ShieldConfig returns the service's shield settings (defaults when unset).
+func (s Service) ShieldConfig() shield.Config {
+	if s.Shield == nil {
+		return shield.Config{}
+	}
+	return *s.Shield
 }
 
 // Limits are rate limits as "N/s", "N/m", "N/h" or "N/d": for the whole service, for each client, and per tool
@@ -307,6 +319,9 @@ func Load(dir string) (*Config, error) {
 	}
 	for i := range c.Services {
 		c.Services[i].Tools.Normalize()
+		if err := c.Services[i].ShieldConfig().Validate(); err != nil {
+			return nil, fmt.Errorf("config %s: service %s: %w", Path(dir), c.Services[i].Name, err)
+		}
 	}
 	return &c, nil
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/harikanthl/toprelay/agent/internal/files"
 	"github.com/harikanthl/toprelay/agent/internal/keys"
 	"github.com/harikanthl/toprelay/agent/internal/mcpproxy"
+	"github.com/harikanthl/toprelay/agent/internal/pins"
 	"github.com/harikanthl/toprelay/agent/internal/redact"
 	"github.com/harikanthl/toprelay/agent/internal/secrets"
 	"github.com/harikanthl/toprelay/agent/internal/service"
@@ -137,6 +138,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return nil
 		case <-d.Reload:
 		case <-t.C:
+			d.refreshPins()
 			if s := fileStamp(config.Path(d.Dir)); s == stamp {
 				continue
 			}
@@ -149,6 +151,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		if err := d.reconcile(ctx, cfg); err != nil {
 			d.Log.Error("config reload failed", "err", err)
+		}
+	}
+}
+
+// refreshPins picks up tool approvals made by `toprelay pins` (also from the Mac app).
+func (d *Daemon) refreshPins() {
+	d.mu.Lock()
+	rs := make(map[string]*runner, len(d.running))
+	for n, r := range d.running {
+		rs[n] = r
+	}
+	d.mu.Unlock()
+	for name, r := range rs {
+		changed, err := r.rt.RefreshPins()
+		if err != nil {
+			d.Log.Warn("can't read the tool pins", "service", name, "err", err)
+			continue
+		}
+		if changed {
+			held := r.rt.Held()
+			d.state.Update(name, func(st *ServiceState) { st.Held = held })
 		}
 	}
 }
@@ -254,6 +277,10 @@ func (d *Daemon) reconcile(ctx context.Context, cfg *config.Config) error {
 				d.Log.Info("tool policy changed", "service", s.Name)
 				r.rt.SetPolicy(s.Tools)
 			}
+			if sc := s.ShieldConfig(); sc != r.rt.ShieldConfig() {
+				d.Log.Info("shield changed", "service", s.Name, "leaks", sc.LeakMode(), "injection", sc.InjectionMode())
+				r.rt.SetShield(sc)
+			}
 			continue
 		}
 		if err := d.start(ctx, base, agentRoot, s); err != nil {
@@ -352,6 +379,12 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 	if err != nil {
 		return fmt.Errorf("open call log: %w", err)
 	}
+	auditKey, err := keys.AuditKey(agentRoot)
+	if err != nil {
+		logw.Close()
+		return err
+	}
+	logw.SetSigner(s.Name, auditKey)
 	logw.OnRecord = func(r calllog.Record) {
 		d.state.Update(s.Name, func(st *ServiceState) {
 			st.Requests++
@@ -361,6 +394,12 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 			if r.Reason == mcpproxy.ReasonRateLimited {
 				st.Limited++
 			}
+			if len(r.Leaks) > 0 {
+				st.Leaks++
+			}
+			if len(r.Warnings) > 0 {
+				st.Warnings++
+			}
 		})
 	}
 	log := d.Log // every component logs the service name itself
@@ -368,6 +407,19 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 	if err != nil {
 		logw.Close()
 		return err
+	}
+	if s.Kind == config.KindMCP {
+		// A damaged pins file stops the service rather than forgetting what was approved.
+		ps, err := pins.Open(pins.Path(d.Dir, s.Name))
+		if err != nil {
+			logw.Close()
+			return err
+		}
+		rt.OnHeld = func([]string) {
+			held := rt.Held()
+			d.state.Update(s.Name, func(st *ServiceState) { st.Held = held })
+		}
+		rt.SetPins(ps)
 	}
 	var relayFiles atomic.Bool
 	var filesHandler http.Handler
@@ -415,7 +467,8 @@ func (d *Daemon) start(ctx context.Context, base, agentRoot string, s config.Ser
 		}
 	}
 	r := &runner{sig: signature(base, s), cred: credSignature(s), limits: limitsSig(s), cancel: cancel, done: make(chan struct{}), rt: rt}
-	d.state.Update(s.Name, func(st *ServiceState) { *st = ServiceState{} })
+	held := rt.Held()
+	d.state.Update(s.Name, func(st *ServiceState) { *st = ServiceState{Held: held} })
 	d.mu.Lock()
 	d.running[s.Name] = r
 	d.mu.Unlock()

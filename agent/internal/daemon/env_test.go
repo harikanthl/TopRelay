@@ -63,8 +63,10 @@ func TestLegacyStdioEnvMovesToKeyring(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cs.Close()
+	// The child echoes its keyring value. That it arrives as a redaction proves both that the child got the exact
+	// value and that the shield kept a keyring secret from leaving the computer.
 	pr, err := cs.GetPrompt(wctx, &mcp.GetPromptParams{Name: "greet"})
-	if err != nil || pr.Messages[0].Content.(*mcp.TextContent).Text != "hi "+value {
+	if err != nil || pr.Messages[0].Content.(*mcp.TextContent).Text != "hi [REDACTED:known-secret]" {
 		t.Fatalf("child env: %v %v", pr, err)
 	}
 }

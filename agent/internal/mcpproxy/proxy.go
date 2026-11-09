@@ -16,6 +16,7 @@ import (
 
 	"github.com/harikanthl/toprelay/agent/internal/httpfwd"
 	"github.com/harikanthl/toprelay/agent/internal/reqctx"
+	"github.com/harikanthl/toprelay/agent/internal/shield"
 )
 
 // MaxBody is the largest request body accepted (the relay's cap).
@@ -38,6 +39,8 @@ const (
 	ReasonCredential     = "credential_unavailable"
 	ReasonUnreachable    = "app_unreachable"
 	ReasonRateLimited    = "rate_limited"
+	// ReasonToolChanged: the tool's definition changed since it was approved (pins), so it is held.
+	ReasonToolChanged = "tool_changed"
 )
 
 // Proxy is a filtering reverse proxy to a Streamable HTTP MCP endpoint. It serves /mcp and /mcp/… .
@@ -65,6 +68,11 @@ type Proxy struct {
 	// Links, if set, turns toprelay-file URIs in tools/call results into public links. client is the relay's
 	// X-Toprelay-Client.
 	Links func(client, uri string) (Link, error)
+	// Held, if set, reports tools held for review because their definition changed (Allowed already refuses
+	// them); their refusals say so.
+	Held func(tool string) bool
+	// Shield, if set, returns the current shield settings, applied to every message from the app.
+	Shield func() shield.Config
 }
 
 var hopHeaders = []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
@@ -143,7 +151,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var d Decision
 	if r.Method == http.MethodPost {
-		d = Decide(body, headerName, p.Service, allowed)
+		d = DecideHeld(body, headerName, p.Service, allowed, p.Held)
 	} else {
 		d = Decision{ListIDs: map[string]bool{}}
 	}
@@ -190,7 +198,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.OnTools(seen)
 		}
 	}
-	xf := Chain(ListTransformLearn(d.ListIDs, allowed, p.OnHints), p.linkTransform(r, d))
+	// The shield sees what the bot would (after the list filter) and runs before file links are minted.
+	xf := Chain(ListTransformLearn(d.ListIDs, allowed, p.OnHints), p.shieldTransform(r), p.linkTransform(r, d))
 	ch := make(chan roundTrip, 1)
 	go func() {
 		resp, err := p.transport().RoundTrip(out)
@@ -298,5 +307,46 @@ func copyFlush(w io.Writer, r io.Reader) error {
 		if err != nil {
 			return err
 		}
+	}
+}
+
+// shieldTransform applies the shield to each message from the app and records findings for the call log.
+func (p *Proxy) shieldTransform(r *http.Request) Transform {
+	if p.Shield == nil {
+		return nil
+	}
+	cfg := p.Shield()
+	if cfg.LeakMode() == shield.LeaksOff && cfg.InjectionMode() == shield.InjectionOff {
+		return nil
+	}
+	found := reqctx.FindingsFrom(r.Context())
+	return func(msg []byte) ([]byte, bool, []string) {
+		out, changed, rep := cfg.InspectMessage(msg, p.Service)
+		RecordShield(found, rep, p.Log, p.Service)
+		return out, changed, nil
+	}
+}
+
+// RecordShield adds a shield report to the request's findings and the agent log.
+func RecordShield(found *reqctx.Findings, rep shield.Report, log *slog.Logger, service string) {
+	if rep.Empty() {
+		return
+	}
+	found.AddLeaks(rep.Leaks, rep.Blocked)
+	for _, f := range rep.Injection {
+		found.AddWarnings("injection:" + f.Rule)
+	}
+	if log == nil {
+		return
+	}
+	if len(rep.Leaks) > 0 {
+		action := "redacted"
+		if rep.Blocked {
+			action = "withheld"
+		}
+		log.Warn("credentials in the app's answer were "+action, "service", service, "rules", shield.Summary(rep.Leaks))
+	}
+	if len(rep.Injection) > 0 {
+		log.Warn("the app's answer contains text that tries to instruct the model", "service", service, "rules", shield.Rules(rep.Injection))
 	}
 }

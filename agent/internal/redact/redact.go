@@ -43,6 +43,13 @@ func Add(values ...string) {
 	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
 }
 
+// Values returns the registered secrets, longest first (a copy).
+func Values() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return append([]string(nil), secrets...)
+}
+
 // String masks every registered secret in s.
 func String(s string) string {
 	mu.RLock()

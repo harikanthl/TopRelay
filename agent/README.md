@@ -39,6 +39,9 @@ Every command has `--help`. Most take `--json` (see below).
 | `tools <name> [--allow a,b] [--deny a,b] [--allow-all] [--reset]` | Show tools (exposed or hidden, annotations) and change the policy; a running `up` applies it live |
 | `tools <name> --client SELECTOR (--allow … \| --deny … \| --reset)` | A per-client rule: `claude.ai`-style domain, `key:<id>`, exact client id, or `prefix*` |
 | `limits <name> [--service R] [--client R] [--tool NAME=R]… [--clear]` | Rate limits in the agent (`60/m`, `10/s`, …): 429 + `Retry-After` |
+| `pins <name> [--approve a,b \| --approve-all] [--forget a,b \| --forget-all]` | Review tools whose definition changed since approval (held: hidden and refused) and approve them; see [Shield, pins and the audit trail](#shield-pins-and-the-audit-trail) |
+| `shield <name> [--leaks redact\|block\|off] [--injection warn\|off]` | Show or change how answers are inspected; with no flags, also scans the current tool descriptions |
+| `audit verify <name> [--key PUBLIC_KEY]` / `audit key` | Check that a service's call log wasn't edited (exit 1 if not); print the public key for verifying elsewhere |
 | `up [--install \| --uninstall]` | Run every service; `--install` adds a launchd agent (`~/Library/LaunchAgents/dev.toprelay.agent.plist`) or a systemd user unit |
 | `status` | Relay-side connection and today's usage per service, against the 100k requests/day free allowance |
 | `status --watch` | Follow the local agent (no relay calls): the state now, then again on every change; with `--json` one line each |
@@ -156,7 +159,8 @@ toprelay test notes      # or: toprelay key notes --for 1h --client curl
                         "reconnectAttempt": 0, "nextRetryMs": 0, "requests": 5, "refused": 1}}}
 ```
 
-`since` is `null` while disconnected. `running` turns `false` when `up` exits; readers (`status`, `status --watch`,
+`leaks` and `warnings` count answers in which the shield redacted credentials or flagged instruction-like text;
+`held` (present when non-empty) lists tools held for review. `since` is `null` while disconnected. `running` turns `false` when `up` exits; readers (`status`, `status --watch`,
 TopRelayKit) also report `false` when `pid` no longer exists, so a crashed agent doesn't look alive. `requests` and
 `refused` count calls in this `up` session.
 
@@ -165,7 +169,8 @@ ignore what you don't know. A file without `version` is version 1. The file is r
 temporary file in the same directory, then renamed), so a reader never sees half of it; watch the directory, not
 the file. Fields: `version` int, `pid` int, `startedAt`/`updatedAt` RFC 3339, `running` bool, `services` map of
 name → `{connected bool, since RFC 3339|null, lastError string, reconnectAttempt int, nextRetryMs int,
-requests int, refused int, limited int}` (`limited`: calls over the service's own rate limits).
+requests int, refused int, limited int, leaks int, warnings int, held [string]?}` (`limited`: calls over the
+service's own rate limits).
 
 `<config dir>/agent.sock` (0600): the control socket of a running `up`, for TopRelayKit. See
 [Control socket](#control-socket). Only one `up` runs per config dir: a second one exits with `already_running`.
@@ -173,8 +178,12 @@ requests int, refused int, limited int}` (`limited`: calls over the service's ow
 `<config dir>/caller-keys/<service>.key` (0600, directory 0700): the key apps use to verify `X-TopRelay-Caller`.
 Made by `add` (or by `up` for older services), replaced by `caller-key --rotate`, deleted by `remove`.
 
-`<config dir>/logs/<service>.jsonl`: one line per call, rotated at 10 MB (one `.1` file kept). With `up
---install`, the daemon's own log is `logs/agent.log`.
+`<config dir>/logs/<service>.jsonl`: one line per call, rotated at 10 MB (one `.1` file kept), hash-chained and
+signed (see [the audit trail](#shield-pins-and-the-audit-trail)). With `up --install`, the daemon's own log is
+`logs/agent.log`.
+
+`<config dir>/pins/<service>.json` (0600): each MCP tool's approved fingerprint and any held changes. Shared by
+`up` and the CLI through a lock file next to it; deleted by `remove`. Deleting it re-pins every tool as it is.
 
 ## JSON output (`--json`)
 
@@ -224,9 +233,20 @@ on a full pipe. `up --json` logs to `<config dir>/logs/agent.log` instead of std
 | `version` | `{"version"}` |
 | `status --watch` | one state.json object per line (below) |
 
-`ToolView` is `{"name","title"?,"description"?,"allowed","readOnly","destructive","idempotent","openWorld","warnings"?}`.
-A call log line is `{"time","method","path","mcpMethod"?,"tool"?,"status","durationMs","client"?,"refused"?,"reason"?,"bytesIn","bytesOut"}`.
-`reason` is `tool_not_allowed`, `invalid_request`, `rate_limited`, `credential_unavailable` or `app_unreachable`.
+`ToolView` is `{"name","title"?,"description"?,"allowed","readOnly","destructive","idempotent","openWorld","warnings"?,"held"?,"findings"?}`.
+`held` is true when the tool's definition changed since approval (then `allowed` is false); `findings` are
+`[{"rule","excerpt"}]` for instruction-like text in its description.
+
+| Command | JSON |
+|---|---|
+| `pins` | `{"service","pinned","held":[{"tool","approvedSha256","nowSha256","before","after","seenAt","descriptionChanged","findings"?}],"approved"?,"forgotten"?}` |
+| `shield` | `{"service","leaks","injection","changed","leakRules","injectionRules","flagged":[{"tool","findings"}],"reachable","error"?}` |
+| `audit verify` | `{"ok","lines","calls","legacy","firstSeq","lastSeq","checkpoints","signedThrough","unsigned","prunes","pruned","keyId"?,"problems":[{"file","line","seq"?,"what"}]}`; exit 1 when `ok` is false |
+| `audit key` | `{"publicKey","keyId"}` |
+
+A call log line is `{"time","method","path","mcpMethod"?,"tool"?,"status","durationMs","client"?,"refused"?,"reason"?,"bytesIn","bytesOut","leaks"?,"blocked"?,"warnings"?,"seq","prev"}`.
+`reason` is `tool_not_allowed`, `tool_changed`, `invalid_request`, `rate_limited`, `credential_unavailable` or
+`app_unreachable`. Lines with a `type` (`checkpoint`, `prune`) belong to the audit chain, not to calls: skip them.
 Bodies, arguments, results and credentials are never logged.
 
 ## What the app receives
@@ -259,6 +279,51 @@ defenses:
    second, the connection is refused; it proves who answered, not that the app is free of bugs, and another
    process of yours can still inject into an app that doesn't use the hardened runtime. A bundle id without a team
    id is refused, because anyone can sign with any bundle id. Off macOS, use a socket.
+
+## Shield, pins and the audit trail
+
+Three checks run in the agent, on your computer, for every MCP service. None of them needs the relay or a
+redeploy.
+
+**Shield (answers).** Every message from the app is inspected before it leaves: JSON results and SSE events,
+including the early-SSE path for long calls and both stdio transports. Inspection works on decoded strings, so
+JSON escapes can't hide a match. Base64 image, audio and blob payloads are skipped.
+
+- *Credentials* (`leaks`, default `redact`). Private keys, AWS/GitHub/GitLab/Slack/Stripe/Google/OpenAI/
+  Anthropic/Hugging Face/npm/PyPI/SendGrid/Twilio keys, JWTs, passwords in URLs, Azure storage keys, TopRelay keys,
+  and every secret the agent itself holds (the app's credential header, stdio env values, the Cloudflare token).
+  Each match becomes `[REDACTED:<rule>]`. `block` instead withholds the whole answer: a tool error the model can
+  relay, or a JSON-RPC error for anything else. `off` doesn't look.
+- *Instruction-like text* (`injection`, default `warn`). Unicode tag characters (invisible text a model still
+  reads), direction overrides, and phrases such as "ignore previous instructions", "do not tell the user",
+  `<IMPORTANT>`, requests for `~/.ssh` or `.aws/credentials`, "send … to https://…", and instructions about other
+  tools. These are matched after removing invisible characters, folding look-alike letters to ASCII, and decoding
+  base64 runs. The answer is never changed; findings go to the call log (`warnings`) and the agent log.
+
+Settings live in the service's `"shield": {"leaks": "block", "injection": "off"}` in config.json. They're absent
+when both are the defaults, and `up` applies changes live. The call log records `leaks` (rule counts such as
+`"jwt×2"`), `blocked` and `warnings` per call, without the matched text.
+
+**Pins (tool definitions).** The first time the agent sees a tool, it records the SHA-256 of the tool's
+canonical definition: name, title, description, input and output schemas, and annotations with MCP defaults
+applied, so `"readOnlyHint": false` and an absent hint are the same. `add` pins what you reviewed while adding.
+If a later listing shows a different definition, the tool is *held* from that very listing on. It's left out of
+`tools/list`, left out of the hello sent to the relay, and its calls are refused with a tool error saying it
+changed (call-log reason `tool_changed`). `toprelay pins <name>` shows the old and new descriptions and any
+injection findings. `--approve` accepts a change, and a running `up` re-exposes the tool within one poll (2 s).
+A server that reverts to the approved definition is released automatically. Held tools show in `tools`,
+`doctor`, and `held` in state.json.
+
+**Audit trail (call log).** Each line has `seq` (from 1) and `prev`, the SHA-256 of the previous line's bytes,
+across rotation. Every 100 lines, after 5 minutes of activity, after a prune, and when `up` stops, the agent
+appends a `"type":"checkpoint"` line. It carries an Ed25519 signature over
+`toprelay/audit/v1\n<service>\n<seq>\n<prev>\n<time>`. The key is derived from `AGENT_ROOT`, so there is
+nothing new to store, and `audit key` prints the public half. Retention (`logs --retention`) only removes the
+oldest lines and records a signed `"type":"prune"` line saying how many. `audit verify` and `doctor` report any
+edited, inserted, deleted or reordered line, and any bad signature. Lines after the last checkpoint are chained
+but not yet signed. Lines written by an older agent are counted as `legacy`. The signing key is in your keyring,
+so this proves the log wasn't changed by anyone *without* your keyring. It doesn't protect against your own
+account (see SECURITY.md).
 
 ## Control socket
 

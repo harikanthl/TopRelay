@@ -220,8 +220,9 @@ nonisolated struct InstallResult: Decodable, Sendable {
 
 /// One line of <config>/logs/<service>.jsonl.
 nonisolated struct CallRecord: Decodable, Sendable, Identifiable, Hashable {
-    /// Stable across re-reads of the log, so the table only redraws when calls change.
-    var id: String { "\(time)|\(method)|\(path)|\(status)|\(durationMs)" }
+    /// Stable across re-reads of the log, so the table only redraws when calls change. `seq` is unique per line
+    /// in chained logs; older lines without it fall back to their fields.
+    var id: String { seq.map { "#\($0)" } ?? "\(time)|\(method)|\(path)|\(status)|\(durationMs)" }
     let time: String
     let method: String
     let path: String
@@ -231,6 +232,16 @@ nonisolated struct CallRecord: Decodable, Sendable, Identifiable, Hashable {
     let durationMs: Int64
     let client: String?
     let refused: Bool?
+    /// Shield findings: credential rules redacted (or withheld, when `blocked`) and instruction-like text.
+    let leaks: [String]?
+    let blocked: Bool?
+    let warnings: [String]?
+    /// Audit chain: lines with a `type` (checkpoint, prune) are bookkeeping, not calls.
+    let type: String?
+    let seq: UInt64?
+
+    var isCall: Bool { type == nil }
+    var hadLeak: Bool { !(leaks ?? []).isEmpty }
 
     var date: Date? { Timestamps.parse(time) }
     var label: String { tool ?? mcpMethod ?? "\(method) \(path)" }

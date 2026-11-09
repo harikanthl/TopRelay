@@ -282,7 +282,7 @@ final class AppModel {
             lines = tailLines(of: rotated, limit: limit - lines.count) + lines
         }
         let decoder = JSONDecoder()
-        return lines.compactMap { try? decoder.decode(CallRecord.self, from: $0) }.reversed()
+        return lines.compactMap { try? decoder.decode(CallRecord.self, from: $0) }.filter(\.isCall).reversed()
     }
 
     /// The last `limit` complete lines of a file, reading at most 256 KiB from its end.

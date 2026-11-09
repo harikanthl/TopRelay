@@ -150,6 +150,11 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 		tools = []*mcp.Tool{}
 	}
 	res.Tools = toolViews(s.Name, tools, p)
+	if lerr == nil {
+		if res.Tools, err = a.reviewTools(s, tools, res.Tools, false); err != nil {
+			return err
+		}
+	}
 	return a.emit(res, func() {
 		if lerr != nil {
 			a.say("warning: can't list tools right now: %v\n", lerr)
@@ -158,6 +163,9 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 			status := "hidden "
 			if v.Allowed {
 				status = "exposed"
+			}
+			if v.Held {
+				status = "HELD   "
 			}
 			var hints []string
 			if v.ReadOnly {
@@ -171,7 +179,17 @@ A running `+"`toprelay up`"+` picks the change up within seconds and tells the r
 			if !v.OpenWorld {
 				hints = append(hints, "closed-world")
 			}
+			if len(v.Findings) > 0 {
+				hints = append(hints, "⚠ suspicious description")
+			}
 			a.say("  %s  %-30s %s\n", status, v.Name, strings.Join(hints, ", "))
+		}
+		for _, v := range res.Tools {
+			for _, w := range v.Warnings {
+				if v.Held || len(v.Findings) > 0 {
+					a.say("warning: %s\n", w)
+				}
+			}
 		}
 		def := "hidden"
 		switch p.Default {

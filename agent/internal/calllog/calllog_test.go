@@ -89,7 +89,7 @@ func TestFollow(t *testing.T) {
 	dir := t.TempDir()
 	p := Path(dir, "s")
 	l, _ := Open(p)
-	l.maxSize = 300
+	l.maxSize = 600            // about two chained lines per file
 	l.Write(Record{Status: 1}) // history: not followed
 	ctx, cancel := context.WithCancel(context.Background())
 	var mu sync.Mutex
